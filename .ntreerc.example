@@ -1,0 +1,34 @@
+# .ntreerc — ntree per-repo config. Copy to your repo root as `.ntreerc`.
+# This file is sourced as bash, so quote values with spaces.
+#
+# SECURITY: because it is sourced as bash, ntree will NOT load it until you
+# explicitly trust it by running `ntree allow` (re-run after any edit).
+
+# Run on `ntree new` to install deps correctly for the branch. This is the
+# recommended way to get deps into a workspace (your package manager installs
+# exactly what the branch's lockfile specifies). Examples:
+#   'npm ci'   'pnpm i'   'yarn install'   'bundle install'
+#   'uv sync'                                    # Python (uv) — .venv in worktree
+#   'poetry config virtualenvs.in-project true --local && poetry install'
+#   'python -m venv .venv && .venv/bin/pip install -r requirements.txt'
+NTREE_SETUP_CMD='npm ci'
+
+# OPTIONAL project-wide default command for `ntree run`. You don't need this:
+# `ntree run <name> [-d] -- <cmd>` runs any command and remembers it per
+# workspace. Quote $PORT with SINGLE quotes so it expands at run time, not now.
+# NTREE_START_CMD='npm run dev'
+
+# Port range assigned to workspaces (first free ports win).
+NTREE_PORT_RANGE_START=3001
+NTREE_PORT_RANGE_END=3099
+
+# Ports reserved per workspace, exported as PORT, PORT2, PORT3, ... into the
+# run environment. Bump this for apps that need several ports.
+NTREE_PORT_COUNT=1
+
+# OPT-IN speed hack (leave empty to use NTREE_SETUP_CMD, which is correct):
+# COW-clone these untracked dirs from main into each new workspace instead of
+# installing. Instant + ~0 disk, but a SNAPSHOT that can be stale — only suits a
+# big npm/yarn node_modules. Never list .venv (absolute paths) or a pnpm/Bun
+# node_modules (already globally deduped).
+# NTREE_CLONE_DIRS='node_modules'

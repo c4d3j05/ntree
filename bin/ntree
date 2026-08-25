@@ -1,0 +1,652 @@
+#!/usr/bin/env bash
+#
+# ntree — run multiple branches of one repo in parallel workspaces,
+#         without duplicating file content on disk.
+#
+# Stack: git worktree + APFS copy-on-write clones + bash.
+# See: https://github.com/c4d3j05/ntree
+#
+set -euo pipefail
+
+readonly NTREE_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 2 ]]; then
+  readonly C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YLW=$'\033[33m'
+  readonly C_DIM=$'\033[2m' C_BLD=$'\033[1m' C_RST=$'\033[0m'
+else
+  readonly C_RED='' C_GRN='' C_YLW='' C_DIM='' C_BLD='' C_RST=''
+fi
+
+info()  { printf '%s\n' "$*" >&2; }
+warn()  { printf '%swarning:%s %s\n' "$C_YLW" "$C_RST" "$*" >&2; }
+die()   { printf '%serror:%s %s\n'   "$C_RED" "$C_RST" "$*" >&2; exit 1; }
+ok()    { printf '%s✓%s %s\n'        "$C_GRN" "$C_RST" "$*" >&2; }
+
+# ---------------------------------------------------------------------------
+# Dependency + repo discovery
+# ---------------------------------------------------------------------------
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# Resolve the MAIN worktree root (where .ntree/ lives), even when invoked from
+# inside a linked worktree or a subdirectory. Worktrees share one common git dir
+# (<main>/.git), so the main root is its parent.
+repo_root() {
+  local cdir
+  cdir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || die "not inside a git repository"
+  dirname "$cdir"
+}
+
+# Globals populated by init_env
+REPO_ROOT="" NTREE_DIR="" STATE_FILE="" LOCK_DIR="" RC_FILE="" NTREE_CMD=""
+
+# Where trusted .ntreerc hashes are recorded (direnv-style allow-list).
+readonly ALLOW_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ntree/allowed"
+
+# Config (defaults; overridable via a trusted .ntreerc)
+NTREE_START_CMD=""          # optional default command for `ntree run` (remembered per ws)
+NTREE_SETUP_CMD=""          # optional: run on `new` to install deps correctly for the
+                            # branch, e.g. 'npm ci', 'pnpm i', 'uv sync', 'bundle install'
+NTREE_PORT_RANGE_START=3001
+NTREE_PORT_RANGE_END=3099
+NTREE_CLONE_DIRS=""         # opt-in speed hack: COW-clone these untracked dirs from main
+                            # (best for a big npm/yarn node_modules; it's a snapshot, so
+                            # prefer NTREE_SETUP_CMD for correctness). Never put .venv here
+                            # — virtualenvs hardcode absolute paths and break when copied.
+NTREE_PORT_COUNT=1          # ports reserved per workspace (PORT, PORT2, PORT3, ...)
+
+rc_hash()       { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+rc_is_allowed() { [[ -f "$ALLOW_FILE" ]] && grep -qxF "$1" "$ALLOW_FILE"; }
+
+init_env() {
+  need git; need jq
+  REPO_ROOT="$(repo_root)"
+  NTREE_DIR="$REPO_ROOT/.ntree"
+  STATE_FILE="$NTREE_DIR/state.json"
+  LOCK_DIR="$NTREE_DIR/.lock"
+  RC_FILE="$REPO_ROOT/.ntreerc"
+
+  mkdir -p "$NTREE_DIR"
+  [[ -f "$STATE_FILE" ]] || echo '{"workspaces":{}}' > "$STATE_FILE"
+
+  # .ntreerc is sourced as bash → only load it if the user has trusted it.
+  if [[ -f "$RC_FILE" ]]; then
+    if rc_is_allowed "$(rc_hash "$RC_FILE")"; then
+      # shellcheck disable=SC1090
+      source "$RC_FILE"
+    elif [[ "$NTREE_CMD" != "allow" ]]; then
+      warn ".ntreerc present but not trusted — using built-in defaults."
+      warn "review it, then run 'ntree allow' to load it (re-run after any edit)."
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# State locking (macOS has no flock; use mkdir as an atomic mutex)
+# ---------------------------------------------------------------------------
+lock() {
+  local tries=0 holder
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    # Self-heal a stale lock left behind by a crashed process (kill -9).
+    holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ -n "$holder" ]] && ! kill -0 "$holder" 2>/dev/null; then
+      warn "reclaiming stale state lock (held by dead pid $holder)"
+      rm -rf "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+    (( tries++ >= 100 )) && die "could not acquire state lock held by pid ${holder:-?} ($LOCK_DIR)"
+    sleep 0.1
+  done
+  echo $$ > "$LOCK_DIR/pid"
+  trap 'unlock' EXIT
+}
+unlock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; trap - EXIT; }
+
+state_get() { jq -r "$1" "$STATE_FILE"; }
+state_update() {
+  # state_update '<jq filter>' [--arg name value ...]
+  local filter="$1"; shift
+  local tmp; tmp="$(mktemp)"
+  jq "$@" "$filter" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Process / port helpers
+# ---------------------------------------------------------------------------
+pid_alive() { [[ -n "${1:-}" && "$1" != "null" ]] && kill -0 "$1" 2>/dev/null; }
+
+# A port is "taken" if any workspace reserves it (new .ports[] or legacy .port).
+port_in_state() {
+  state_get '.workspaces | to_entries[] | .value | (.ports // [.port]) | .[]' 2>/dev/null \
+    | grep -qx "$1"
+}
+# Check both stacks: `localhost` may resolve to ::1 while a server binds IPv4-only.
+port_listening() {
+  nc -z 127.0.0.1 "$1" >/dev/null 2>&1 || nc -z ::1 "$1" >/dev/null 2>&1
+}
+
+# Allocate <count> free ports (ascending, so never duplicated within a batch).
+# Must be called under the state lock. Echoes them space-separated.
+alloc_ports() {
+  local count="$1" p
+  local -a found=()
+  for (( p = NTREE_PORT_RANGE_START; p <= NTREE_PORT_RANGE_END; p++ )); do
+    port_in_state "$p" && continue
+    port_listening "$p" && continue
+    found+=("$p")
+    (( ${#found[@]} == count )) && { echo "${found[*]}"; return 0; }
+  done
+  die "not enough free ports (need $count) in range $NTREE_PORT_RANGE_START-$NTREE_PORT_RANGE_END"
+}
+
+# Echo a workspace's reserved ports, one per line (legacy .port aware).
+ws_ports() { state_get ".workspaces[\"$1\"] | (.ports // [.port]) | .[]"; }
+
+# Write <path>/.env.workspace with the workspace id + PORT, PORT2, PORT3, ...
+# Args: <path> <name> <port...>
+_write_env() {
+  local path="$1" name="$2"; shift 2
+  local pf="$path/.env.workspace" i=1 p
+  echo "NTREE_WORKSPACE=$name" > "$pf"     # stable per-workspace key for DB/service isolation
+  for p in "$@"; do
+    if (( i == 1 )); then echo "PORT=$p" >> "$pf"; else echo "PORT$i=$p" >> "$pf"; fi
+    (( i++ ))
+  done
+}
+
+ws_exists() { state_get ".workspaces | has(\"$1\")" | grep -qx true; }
+require_ws() { ws_exists "$1" || die "no such workspace: $1"; }
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_new() {
+  local branch="" base=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) base="${2:-}"; shift 2 ;;
+      -*)     die "unknown flag: $1" ;;
+      *)      branch="$1"; shift ;;
+    esac
+  done
+  [[ -n "$branch" ]] || die "usage: ntree new <branch> [--from <base>]"
+
+  local name="${branch//\//-}"
+  local path="$NTREE_DIR/$name"
+
+  lock
+  ws_exists "$name" && { unlock; die "workspace already exists: $name"; }
+  _provision_ws "$name" "$branch" "$base"
+  local ports; ports="$(ws_ports "$name" | tr '\n' ' ')"
+  unlock
+
+  _run_setup "$name" "$path"
+
+  ok "created workspace ${C_BLD}$name${C_RST} (branch $branch, port(s): ${ports% })"
+  info "  path: $path"
+  info "  start it with: ${C_BLD}ntree run $name -d -- <cmd>${C_RST}"
+}
+
+# Warn if the new workspace's lockfile differs from the cloned deps' source.
+warn_lockfile_drift() {
+  local path="$1" lf
+  for lf in package-lock.json pnpm-lock.yaml yarn.lock poetry.lock uv.lock; do
+    if [[ -f "$REPO_ROOT/$lf" && -f "$path/$lf" ]] \
+       && ! cmp -s "$REPO_ROOT/$lf" "$path/$lf"; then
+      warn "$lf differs from main — cloned deps may be stale; run your installer in $path"
+    fi
+  done
+}
+
+# Provision a workspace: worktree + COW-cloned deps + port + registry entry.
+# Caller must hold the state lock. Args: <name> <branch> <base>
+_provision_ws() {
+  local name="$1" branch="$2" base="$3"
+  local path="$NTREE_DIR/$name" d src
+
+  # 1. worktree (create branch if it doesn't exist yet)
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$REPO_ROOT" worktree add "$path" "$branch" >&2
+  else
+    git -C "$REPO_ROOT" worktree add -b "$branch" "$path" "${base:-HEAD}" >&2
+  fi
+
+  # 2. Opt-in: COW-clone heavy untracked dirs from main (empty by default)
+  local cloned_any=0
+  for d in $NTREE_CLONE_DIRS; do
+    src="$REPO_ROOT/$d"
+    [[ -e "$src" ]] || continue
+    [[ -e "$path/$d" ]] && continue   # already present (e.g. git-tracked in the worktree)
+    # Python virtualenvs hardcode absolute paths — cloning yields a broken venv.
+    if [[ -f "$src/pyvenv.cfg" || -f "$src/bin/activate" ]]; then
+      warn "$d looks like a Python virtualenv — it hardcodes absolute paths and can't be safely cloned; skipping."
+      warn "  recreate it via NTREE_SETUP_CMD instead (e.g. 'python -m venv $d && $d/bin/pip install -r requirements.txt')"
+      continue
+    fi
+    if cp -c -R "$src" "$path/$d" 2>/dev/null; then
+      ok "cloned $d (APFS copy-on-write)"; cloned_any=1
+    else
+      warn "APFS clone failed for $d; falling back to plain copy (uses disk)"
+      cp -R "$src" "$path/$d"; cloned_any=1
+    fi
+  done
+  (( cloned_any )) && warn_lockfile_drift "$path"
+
+  # 3. allocate port(s) + write env (PORT, PORT2, ... + NTREE_WORKSPACE)
+  local ports; ports="$(alloc_ports "$NTREE_PORT_COUNT")"
+  _write_env "$path" "$name" $ports
+
+  # keep ntree's own files out of `git status` / accidental commits
+  local excl; excl="$(git -C "$path" rev-parse --git-path info/exclude 2>/dev/null || true)"
+  if [[ -n "$excl" && -f "$excl" ]] && ! grep -qxF '.env.workspace' "$excl" 2>/dev/null; then
+    printf '.env.workspace\nntree.log\n' >> "$excl"
+  fi
+
+  # 4. register (port = first, ports = full list)
+  state_update '.workspaces[$n] = {branch:$b, path:$p, ports:($ports|split(" ")|map(tonumber)), port:($ports|split(" ")|.[0]|tonumber), pid:null, created:$ts}' \
+    --arg n "$name" --arg b "$branch" --arg p "$path" \
+    --arg ports "$ports" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+# Run NTREE_SETUP_CMD in a workspace to install deps (no-op if unset). Runs
+# OUTSIDE the state lock — installs can be slow. Args: <name> <path>
+_run_setup() {
+  local name="$1" path="$2"
+  [[ -n "${NTREE_SETUP_CMD:-}" ]] || return 0
+  info "setup ($name): $NTREE_SETUP_CMD"
+  local rc=0
+  set +e +o pipefail
+  ( cd "$path" && set -a && . ./.env.workspace && set +a && bash -c "$NTREE_SETUP_CMD" ) 2>&1 | tee -a "$path/ntree.log"
+  rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+  (( rc == 0 )) && ok "setup complete" || warn "setup exited $rc — deps may be incomplete"
+}
+
+# Tear down a workspace: kill process, remove worktree, drop from state.
+# Args: <name> <path>
+_remove_ws() {
+  local name="$1" path="$2" pid
+  pid="$(state_get ".workspaces[\"$name\"].pid")"
+  pid_alive "$pid" && { kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true; }
+  git -C "$REPO_ROOT" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  lock
+  state_update 'del(.workspaces[$n])' --arg n "$name"
+  unlock
+}
+
+# Run a command in a workspace's worktree. Foreground by default (streams output,
+# returns the command's exit code); with -d it runs detached in the background
+# (tracked by PID, stop with `ntree stop`). Creates the workspace if missing.
+# Everything after `--` is run as a shell command line (quote $PORT with single
+# quotes so it expands at run time). Falls back to a remembered command, then to
+# NTREE_START_CMD, when none is given.
+cmd_run() {
+  local branch="" base="" do_rm=0 detach=0
+  local -a cmd=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)       base="${2:-}"; shift 2 ;;
+      --rm)         do_rm=1; shift ;;
+      -d|--detach)  detach=1; shift ;;
+      --)           shift; cmd=("$@"); break ;;
+      -*)           die "unknown flag: $1" ;;
+      *)            branch="$1"; shift ;;
+    esac
+  done
+  [[ -n "$branch" ]] || die "usage: ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>"
+  (( detach && do_rm )) && die "--detach and --rm can't be combined"
+
+  local name="${branch//\//-}" created=0
+  lock
+  if ! ws_exists "$name"; then
+    _provision_ws "$name" "$branch" "$base"; created=1
+  fi
+  unlock
+
+  local path log
+  path="$(state_get ".workspaces[\"$name\"].path")"
+  log="$path/ntree.log"
+  (( created )) && _run_setup "$name" "$path"
+
+  # Resolve the command: explicit `-- cmd` (remembered) > remembered > NTREE_START_CMD
+  local cmd_str=""
+  if (( ${#cmd[@]} > 0 )); then
+    cmd_str="${cmd[*]}"
+    lock; state_update '.workspaces[$n].cmd = $c' --arg n "$name" --arg c "$cmd_str"; unlock
+  else
+    cmd_str="$(state_get ".workspaces[\"$name\"].cmd // empty")"
+    [[ -z "$cmd_str" ]] && cmd_str="${NTREE_START_CMD:-}"
+  fi
+  [[ -n "$cmd_str" ]] || die "no command — put it after --, e.g: ntree run $name -- npm test"
+
+  if (( detach )); then
+    _run_detached "$name" "$path" "$log" "$cmd_str"
+    return 0
+  fi
+
+  local port; port="$(state_get ".workspaces[\"$name\"].port")"
+  (( created )) && info "created workspace $name (branch $branch)" \
+                || info "reusing workspace $name (branch $branch)"
+  info "running (PORT=$port): $cmd_str"
+
+  local rc=0
+  set +e +o pipefail
+  ( cd "$path" && set -a && . ./.env.workspace && set +a && bash -c "$cmd_str" ) 2>&1 | tee -a "$log"
+  rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+
+  if (( do_rm )); then _remove_ws "$name" "$path"; info "removed workspace $name"; fi
+  if (( rc == 0 )); then ok "run finished (exit 0)"; else warn "run exited $rc"; fi
+  return "$rc"
+}
+
+# Launch a command detached (own process group), track its PID. Args: name path log cmd
+_run_detached() {
+  local name="$1" path="$2" log="$3" cmd_str="$4"
+  local pid; pid="$(state_get ".workspaces[\"$name\"].pid")"
+  pid_alive "$pid" && die "workspace $name already running (pid $pid)"
+
+  # Ports were reserved at `new` time — reallocate the set if one was grabbed since.
+  local conflict=0 p
+  for p in $(ws_ports "$name"); do port_listening "$p" && conflict=1; done
+  if (( conflict )); then
+    warn "assigned port(s) now in use by another process — reallocating"
+    local cnt newports; cnt="$(ws_ports "$name" | grep -c .)"
+    lock
+    newports="$(alloc_ports "$cnt")"
+    _write_env "$path" "$name" $newports
+    state_update '.workspaces[$n].ports = ($p|split(" ")|map(tonumber)) | .workspaces[$n].port = ($p|split(" ")|.[0]|tonumber)' \
+      --arg n "$name" --arg p "$newports"
+    unlock
+  fi
+  local port; port="$(state_get ".workspaces[\"$name\"].port")"
+
+  info "starting (detached): $cmd_str (PORT=$port) → $log"
+  # Job control so the background job is its own process-group leader (macOS has
+  # no setsid); then $newpid is a real pgid and `stop` can kill the whole tree.
+  set -m
+  ( cd "$path" && set -a && . ./.env.workspace && set +a && exec bash -c "$cmd_str" ) >"$log" 2>&1 &
+  local newpid=$!
+  set +m
+
+  lock
+  state_update '.workspaces[$n].pid = ($pid|tonumber)' --arg n "$name" --arg pid "$newpid"
+  unlock
+  ok "started $name (pid $newpid, port $port)"
+}
+
+cmd_list() {
+  local names; names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"
+  if [[ -z "$names" ]]; then info "no workspaces yet — create one with: ntree new <branch>"; return; fi
+  printf '%s%-20s %-24s %-6s %-9s %s%s\n' "$C_BLD" NAME BRANCH PORT STATUS PATH "$C_RST" >&2
+  local n
+  while IFS= read -r n; do
+    local branch port pid path status
+    branch="$(state_get ".workspaces[\"$n\"].branch")"
+    port="$(state_get ".workspaces[\"$n\"].port")"
+    pid="$(state_get ".workspaces[\"$n\"].pid")"
+    path="$(state_get ".workspaces[\"$n\"].path")"
+    local pc; pc="$(state_get ".workspaces[\"$n\"] | (.ports // [.port]) | length")"
+    (( pc > 1 )) && port="$port+$((pc-1))"
+    if pid_alive "$pid"; then status="${C_GRN}running${C_RST}"; else status="${C_DIM}stopped${C_RST}"; fi
+    printf '%-20s %-24s %-6s %-9b %s\n' "$n" "$branch" "$port" "$status" "$path" >&2
+  done <<< "$names"
+}
+
+cmd_stop() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree stop <name>"
+  init_env; require_ws "$name"
+  local pid; pid="$(state_get ".workspaces[\"$name\"].pid")"
+  if pid_alive "$pid"; then
+    kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    ok "stopped $name (pid $pid)"
+  else
+    info "$name is not running"
+  fi
+  lock
+  state_update '.workspaces[$n].pid = null' --arg n "$name"
+  unlock
+}
+
+cmd_open() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree open <name>"
+  init_env; require_ws "$name"
+  local path; path="$(state_get ".workspaces[\"$name\"].path")"
+  if [[ -n "${EDITOR:-}" ]]; then "$EDITOR" "$path"
+  elif command -v code >/dev/null 2>&1; then code "$path"
+  else open "$path"; fi
+}
+
+# Print a workspace's absolute worktree path to stdout (for shell integration).
+cmd_path() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree path <name>"
+  require_ws "$name"
+  state_get ".workspaces[\"$name\"].path"
+}
+
+# Print a shell function that adds `cd` support. Add to ~/.zshrc / ~/.bashrc:
+#   eval "$(ntree shell-init)"
+# Then `ntree <workspace>` (or `ntree cd <workspace>`) changes directory.
+cmd_shell_init() {
+  cat <<'SH'
+ntree() {
+  if [ "$1" = "cd" ]; then
+    local __d; __d="$(command ntree path "${2:-}")" || return
+    cd "$__d"
+    return
+  fi
+  case "${1:-}" in
+    ""|new|run|list|ls|stop|open|git|sync-deps|allow|rm|doctor|path|shell-init|version|--version|-v|help|--help|-h)
+      command ntree "$@" ;;
+    *)
+      local __d
+      if __d="$(command ntree path "$1" 2>/dev/null)"; then cd "$__d"; else command ntree "$@"; fi ;;
+  esac
+}
+SH
+}
+
+# Run any git command in a workspace's worktree. Everything after <name>
+# is passed straight to git; exit code is git's.
+cmd_git() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree git <name> <git-args...>"
+  shift
+  require_ws "$name"
+  local path; path="$(state_get ".workspaces[\"$name\"].path")"
+  git -C "$path" "$@"
+}
+
+# Trust this repo's .ntreerc so init_env will source it. Re-run after edits.
+cmd_allow() {
+  [[ -f "$RC_FILE" ]] || die "no .ntreerc at $REPO_ROOT"
+  local h; h="$(rc_hash "$RC_FILE")"
+  if rc_is_allowed "$h"; then info ".ntreerc already trusted"; return; fi
+  mkdir -p "$(dirname "$ALLOW_FILE")"
+  printf '%s\n' "$h" >> "$ALLOW_FILE"
+  ok "trusted .ntreerc — it will now be loaded (re-run 'ntree allow' after edits)"
+}
+
+# Refresh a workspace's deps (or all): re-clone any NTREE_CLONE_DIRS, then re-run
+# NTREE_SETUP_CMD. Use after a lockfile change in main.
+cmd_sync_deps() {
+  local target="${1:-}" names
+  if [[ -n "$target" ]]; then require_ws "$target"; names="$target"
+  else names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"; fi
+  [[ -n "$names" ]] || { info "no workspaces to sync"; return; }
+  if [[ -z "${NTREE_CLONE_DIRS:-}" && -z "${NTREE_SETUP_CMD:-}" ]]; then
+    warn "nothing to sync — set NTREE_SETUP_CMD (e.g. 'npm ci') or NTREE_CLONE_DIRS in .ntreerc"
+    return
+  fi
+  local n d src
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    local path; path="$(state_get ".workspaces[\"$n\"].path")"
+    [[ -d "$path" ]] || { warn "$n: worktree folder missing — skipping (run 'ntree doctor')"; continue; }
+    info "syncing deps into $n"
+    for d in $NTREE_CLONE_DIRS; do
+      src="$REPO_ROOT/$d"
+      [[ -e "$src" ]] || continue
+      if [[ -f "$src/pyvenv.cfg" || -f "$src/bin/activate" ]]; then
+        warn "  $d is a virtualenv — skipping (use NTREE_SETUP_CMD to recreate it)"; continue
+      fi
+      rm -rf "$path/$d"
+      if cp -c -R "$src" "$path/$d" 2>/dev/null; then ok "  re-cloned $d"
+      else warn "  APFS clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
+    done
+    _run_setup "$n" "$path"
+  done <<< "$names"
+}
+
+cmd_rm() {
+  local name="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force|-f) force=1; shift ;;
+      *)          name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: ntree rm <name> [--force]"
+  init_env; require_ws "$name"
+
+  if (( ! force )); then
+    printf 'Remove workspace %s and its folder? [y/N] ' "$name" >&2
+    read -r reply; [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted"; return; }
+  fi
+
+  local path; path="$(state_get ".workspaces[\"$name\"].path")"
+  _remove_ws "$name" "$path"
+  ok "removed workspace $name"
+}
+
+cmd_doctor() {
+  local rc=0
+  need git; need jq
+  local gv; gv="$(git --version | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  if [[ "$(printf '%s\n2.40\n' "$gv" | sort -V | head -1)" == "2.40" ]]; then
+    ok "git $gv (>= 2.40)"
+  else
+    warn "git $gv is older than recommended 2.40"; rc=1
+  fi
+  if diskutil info / 2>/dev/null | grep -q 'APFS'; then
+    ok "root filesystem is APFS (copy-on-write clones available)"
+  else
+    warn "root filesystem is not APFS — clones fall back to full copies"; rc=1
+  fi
+  command -v nc >/dev/null 2>&1 && ok "nc present (port probing)" || { warn "nc missing"; rc=1; }
+
+  init_env
+  if [[ -f "$RC_FILE" ]]; then
+    if rc_is_allowed "$(rc_hash "$RC_FILE")"; then ok ".ntreerc is trusted"
+    else warn ".ntreerc present but not trusted — run 'ntree allow' to load it"; fi
+  fi
+
+  # Clear a stale state lock left by a crashed process.
+  if [[ -d "$LOCK_DIR" ]]; then
+    local lh; lh="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
+    if [[ -z "$lh" ]] || ! kill -0 "$lh" 2>/dev/null; then
+      rm -rf "$LOCK_DIR"; ok "cleared stale state lock"
+    else
+      warn "state lock currently held by live pid $lh"
+    fi
+  fi
+
+  # Let git drop bookkeeping for worktrees whose folders are gone.
+  git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
+
+  # Reconcile state.json against reality: prune missing worktrees, flag deleted
+  # branches, clear dead PIDs.
+  local names; names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"
+  local n cleaned=0
+  while IFS= read -r n; do
+    [[ -z "$n" ]] && continue
+    local path branch pid
+    path="$(state_get ".workspaces[\"$n\"].path")"
+    branch="$(state_get ".workspaces[\"$n\"].branch")"
+    pid="$(state_get ".workspaces[\"$n\"].pid")"
+    if [[ ! -d "$path" ]]; then
+      lock; state_update 'del(.workspaces[$n])' --arg n "$n"; unlock
+      warn "pruned '$n' from state — worktree folder missing ($path)"; cleaned=1; continue
+    fi
+    if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+      warn "'$n' tracks branch '$branch' which no longer exists"
+    fi
+    if [[ "$pid" != "null" ]] && ! pid_alive "$pid"; then
+      lock; state_update '.workspaces[$n].pid = null' --arg n "$n"; unlock
+      info "cleared stale pid for $n"; cleaned=1
+    fi
+  done <<< "$names"
+
+  # Flag folders under .ntree/ that aren't tracked in state (orphan worktrees).
+  local d base
+  for d in "$NTREE_DIR"/*/; do
+    [[ -d "$d" ]] || continue
+    base="$(basename "$d")"
+    if ! state_get '.workspaces | keys[]' 2>/dev/null | grep -qx "$base"; then
+      warn "untracked folder in .ntree/: $base (leftover? remove manually or 'git worktree remove')"
+    fi
+  done
+
+  (( cleaned )) && ok "reconciled state with reality"
+  ok "state file OK: $STATE_FILE"
+  return $rc
+}
+
+usage() {
+  cat >&2 <<EOF
+${C_BLD}ntree${C_RST} — parallel git worktree workspaces with APFS copy-on-write (v$NTREE_VERSION)
+
+${C_BLD}usage:${C_RST} ntree <command> [args]
+
+  new <branch> [--from <base>]   create workspace (worktree + ports; runs
+                                 NTREE_SETUP_CMD to install deps if set)
+  run <branch> [-d] [--rm] -- <cmd>
+                                 run a command in the workspace's worktree
+                                 (creates it if needed). Foreground: exits with
+                                 cmd's code. With -d: detached/background, tracked
+                                 by pid (stop with 'ntree stop'). Remembers cmd.
+  list                           show workspaces, branches, ports, status
+  stop <name>                    stop a detached (run -d) process
+  open <name>                    open folder in \$EDITOR / VS Code
+  git <name> <args...>           run any git command in the workspace's worktree
+  sync-deps [<name>]             refresh deps (re-run setup / re-clone; all if omitted)
+  rm <name> [--force]            stop, remove worktree, delete folder
+  allow                          trust this repo's .ntreerc so it gets loaded
+  path <name>                    print a workspace's absolute path
+  cd <name>                      cd into a workspace (needs shell integration)
+  doctor                         verify APFS, reconcile state, prune stale entries
+  version                        print version
+  help                           this message
+
+shell integration (enables 'ntree <workspace>' and 'ntree cd <workspace>' to cd):
+  add to ~/.zshrc or ~/.bashrc:   eval "\$(ntree shell-init)"
+
+config: .ntreerc at repo root (sourced only after 'ntree allow'; see .ntreerc.example)
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; NTREE_CMD="$cmd"; shift || true
+  case "$cmd" in
+    new)     init_env; cmd_new "$@" ;;
+    run)     init_env; cmd_run "$@" ;;
+    list|ls) init_env; cmd_list "$@" ;;
+    stop)    cmd_stop "$@" ;;
+    open)    cmd_open "$@" ;;
+    git)     init_env; cmd_git "$@" ;;
+    sync-deps) init_env; cmd_sync_deps "$@" ;;
+    allow)   init_env; cmd_allow "$@" ;;
+    rm)      cmd_rm "$@" ;;
+    path)    init_env; cmd_path "$@" ;;
+    shell-init) cmd_shell_init ;;
+    cd)      die "'ntree cd' needs shell integration — add to ~/.zshrc: eval \"\$(ntree shell-init)\"" ;;
+    doctor)  cmd_doctor "$@" ;;
+    version|--version|-v) echo "ntree $NTREE_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
