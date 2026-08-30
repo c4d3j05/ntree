@@ -57,6 +57,9 @@ NTREE_CLONE_DIRS=""         # opt-in speed hack: COW-clone these untracked dirs 
                             # prefer NTREE_SETUP_CMD for correctness). Never put .venv here
                             # — virtualenvs hardcode absolute paths and break when copied.
 NTREE_PORT_COUNT=1          # ports reserved per workspace (PORT, PORT2, PORT3, ...)
+NTREE_PORTS=""              # optional friendly port names, e.g. 'API FRONTEND'. When set,
+                            # its length is the port count and each port also gets a
+                            # <NAME>_PORT alias (API_PORT, FRONTEND_PORT) alongside PORT/PORT2.
 
 rc_hash()       { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
 rc_is_allowed() { [[ -f "$ALLOW_FILE" ]] && grep -qxF "$1" "$ALLOW_FILE"; }
@@ -128,6 +131,42 @@ port_listening() {
   nc -z 127.0.0.1 "$1" >/dev/null 2>&1 || nc -z ::1 "$1" >/dev/null 2>&1
 }
 
+# Kill dev servers belonging to a worktree so teardown never leaves a zombie.
+# Scans ALL TCP listeners and kills any whose working dir is inside the worktree
+# — regardless of port, so a server on an unmapped/auto-picked port (Vite's 5173,
+# a hardcoded port, a framework's next-free bump) is reclaimed too. Only listeners
+# are targeted, so your interactive shell (cd'd in but not listening) is spared.
+# TERM, brief wait, then KILL. Args: <worktree_path>
+free_ports() {
+  local wpath="$1"
+  [[ -n "$wpath" && "$wpath" != "null" ]] || return 0
+  command -v lsof >/dev/null 2>&1 || return 0
+
+  # All TCP listeners on the machine → their pids.
+  local -a lpids
+  lpids=($(lsof -nP -iTCP -sTCP:LISTEN -t 2>/dev/null | sort -u))
+  (( ${#lpids[@]} )) || return 0
+
+  # Look up every listener's cwd in ONE lsof call; keep those inside the worktree.
+  local pidcsv line pid="" cwd
+  local -a doomed=()
+  pidcsv="$(IFS=,; echo "${lpids[*]}")"
+  while IFS= read -r line; do
+    case "$line" in
+      p*) pid="${line#p}" ;;
+      n*) cwd="${line#n}"
+          [[ "$cwd" == "$wpath" || "$cwd" == "$wpath"/* ]] && doomed+=("$pid") ;;
+    esac
+  done < <(lsof -a -d cwd -p "$pidcsv" -Fpn 2>/dev/null)
+
+  (( ${#doomed[@]} )) || return 0
+  local -a uniq; uniq=($(printf '%s\n' "${doomed[@]}" | sort -u)); local d
+  for d in "${uniq[@]}"; do kill "$d" 2>/dev/null || true; done
+  sleep 0.3
+  for d in "${uniq[@]}"; do pid_alive "$d" && kill -9 "$d" 2>/dev/null || true; done
+  info "killed worktree server(s) still running in $wpath (pid(s): ${uniq[*]})"
+}
+
 # Allocate <count> free ports (ascending, so never duplicated within a batch).
 # Must be called under the state lock. Echoes them space-separated.
 alloc_ports() {
@@ -145,14 +184,28 @@ alloc_ports() {
 # Echo a workspace's reserved ports, one per line (legacy .port aware).
 ws_ports() { state_get ".workspaces[\"$1\"] | (.ports // [.port]) | .[]"; }
 
+# How many ports to reserve: explicit override (--ports) > NTREE_PORTS length > NTREE_PORT_COUNT.
+# Args: [override]
+_resolve_port_count() {
+  local override="${1:-}"
+  [[ -n "$override" ]] && { echo "$override"; return; }
+  local -a names=($NTREE_PORTS)
+  (( ${#names[@]} > 0 )) && { echo "${#names[@]}"; return; }
+  echo "$NTREE_PORT_COUNT"
+}
+
 # Write <path>/.env.workspace with the workspace id + PORT, PORT2, PORT3, ...
+# When NTREE_PORTS names are set, each port also gets a positional <NAME>_PORT alias.
 # Args: <path> <name> <port...>
 _write_env() {
   local path="$1" name="$2"; shift 2
   local pf="$path/.env.workspace" i=1 p
+  local -a names=($NTREE_PORTS)            # optional friendly names, positional
   echo "NTREE_WORKSPACE=$name" > "$pf"     # stable per-workspace key for DB/service isolation
   for p in "$@"; do
     if (( i == 1 )); then echo "PORT=$p" >> "$pf"; else echo "PORT$i=$p" >> "$pf"; fi
+    local nm="${names[$((i-1))]:-}"
+    [[ -n "$nm" ]] && echo "${nm}_PORT=$p" >> "$pf"
     (( i++ ))
   done
 }
@@ -164,22 +217,24 @@ require_ws() { ws_exists "$1" || die "no such workspace: $1"; }
 # Commands
 # ---------------------------------------------------------------------------
 cmd_new() {
-  local branch="" base=""
+  local branch="" base="" ports=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from) base="${2:-}"; shift 2 ;;
-      -*)     die "unknown flag: $1" ;;
-      *)      branch="$1"; shift ;;
+      --from)  base="${2:-}"; shift 2 ;;
+      --ports) ports="${2:-}"; shift 2 ;;
+      -*)      die "unknown flag: $1" ;;
+      *)       branch="$1"; shift ;;
     esac
   done
-  [[ -n "$branch" ]] || die "usage: ntree new <branch> [--from <base>]"
+  [[ -n "$branch" ]] || die "usage: ntree new <branch> [--from <base>] [--ports <n>]"
+  [[ -z "$ports" || "$ports" =~ ^[1-9][0-9]*$ ]] || die "--ports must be a positive integer"
 
   local name="${branch//\//-}"
   local path="$NTREE_DIR/$name"
 
   lock
   ws_exists "$name" && { unlock; die "workspace already exists: $name"; }
-  _provision_ws "$name" "$branch" "$base"
+  _provision_ws "$name" "$branch" "$base" "$ports"
   local ports; ports="$(ws_ports "$name" | tr '\n' ' ')"
   unlock
 
@@ -202,9 +257,9 @@ warn_lockfile_drift() {
 }
 
 # Provision a workspace: worktree + COW-cloned deps + port + registry entry.
-# Caller must hold the state lock. Args: <name> <branch> <base>
+# Caller must hold the state lock. Args: <name> <branch> <base> [port_count_override]
 _provision_ws() {
-  local name="$1" branch="$2" base="$3"
+  local name="$1" branch="$2" base="$3" port_override="${4:-}"
   local path="$NTREE_DIR/$name" d src
 
   # 1. worktree (create branch if it doesn't exist yet)
@@ -236,7 +291,8 @@ _provision_ws() {
   (( cloned_any )) && warn_lockfile_drift "$path"
 
   # 3. allocate port(s) + write env (PORT, PORT2, ... + NTREE_WORKSPACE)
-  local ports; ports="$(alloc_ports "$NTREE_PORT_COUNT")"
+  local count; count="$(_resolve_port_count "$port_override")"
+  local ports; ports="$(alloc_ports "$count")"
   _write_env "$path" "$name" $ports
 
   # keep ntree's own files out of `git status` / accidental commits
@@ -271,6 +327,7 @@ _remove_ws() {
   local name="$1" path="$2" pid
   pid="$(state_get ".workspaces[\"$name\"].pid")"
   pid_alive "$pid" && { kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true; }
+  free_ports "$path"   # kill any untracked server still running in the worktree
   git -C "$REPO_ROOT" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
   lock
   state_update 'del(.workspaces[$n])' --arg n "$name"
@@ -284,11 +341,12 @@ _remove_ws() {
 # quotes so it expands at run time). Falls back to a remembered command, then to
 # NTREE_START_CMD, when none is given.
 cmd_run() {
-  local branch="" base="" do_rm=0 detach=0
+  local branch="" base="" do_rm=0 detach=0 ports=""
   local -a cmd=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from)       base="${2:-}"; shift 2 ;;
+      --ports)      ports="${2:-}"; shift 2 ;;
       --rm)         do_rm=1; shift ;;
       -d|--detach)  detach=1; shift ;;
       --)           shift; cmd=("$@"); break ;;
@@ -296,13 +354,14 @@ cmd_run() {
       *)            branch="$1"; shift ;;
     esac
   done
-  [[ -n "$branch" ]] || die "usage: ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>"
+  [[ -n "$branch" ]] || die "usage: ntree run <branch> [--from <base>] [--ports <n>] [-d] [--rm] -- <cmd...>"
+  [[ -z "$ports" || "$ports" =~ ^[1-9][0-9]*$ ]] || die "--ports must be a positive integer"
   (( detach && do_rm )) && die "--detach and --rm can't be combined"
 
   local name="${branch//\//-}" created=0
   lock
   if ! ws_exists "$name"; then
-    _provision_ws "$name" "$branch" "$base"; created=1
+    _provision_ws "$name" "$branch" "$base" "$ports"; created=1
   fi
   unlock
 
@@ -379,9 +438,12 @@ _run_detached() {
 }
 
 cmd_list() {
+  printf '%s%-20s %-24s %-6s %-9s %s%s\n' "$C_BLD" NAME BRANCH PORT STATUS PATH "$C_RST" >&2
+  # The primary checkout isn't an ntree workspace, but it's part of the picture.
+  local root_branch; root_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  printf '%-20s %-24s %-6s %-9b %s\n' "(root)" "$root_branch" "-" "${C_DIM}-${C_RST}" "$REPO_ROOT" >&2
   local names; names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"
   if [[ -z "$names" ]]; then info "no workspaces yet — create one with: ntree new <branch>"; return; fi
-  printf '%s%-20s %-24s %-6s %-9s %s%s\n' "$C_BLD" NAME BRANCH PORT STATUS PATH "$C_RST" >&2
   local n
   while IFS= read -r n; do
     local branch port pid path status
@@ -399,13 +461,15 @@ cmd_list() {
 cmd_stop() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree stop <name>"
   init_env; require_ws "$name"
-  local pid; pid="$(state_get ".workspaces[\"$name\"].pid")"
+  local pid path; pid="$(state_get ".workspaces[\"$name\"].pid")"
+  path="$(state_get ".workspaces[\"$name\"].path")"
   if pid_alive "$pid"; then
     kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     ok "stopped $name (pid $pid)"
   else
     info "$name is not running"
   fi
+  free_ports "$path"   # also reclaim ports from any untracked server in the worktree
   lock
   state_update '.workspaces[$n].pid = null' --arg n "$name"
   unlock
@@ -600,19 +664,22 @@ ${C_BLD}ntree${C_RST} — parallel git worktree workspaces with APFS copy-on-wri
 
 ${C_BLD}usage:${C_RST} ntree <command> [args]
 
-  new <branch> [--from <base>]   create workspace (worktree + ports; runs
-                                 NTREE_SETUP_CMD to install deps if set)
+  new <branch> [--from <base>] [--ports <n>]
+                                 create workspace (worktree + ports; runs
+                                 NTREE_SETUP_CMD to install deps if set).
+                                 --ports overrides how many ports to reserve.
   run <branch> [-d] [--rm] -- <cmd>
                                  run a command in the workspace's worktree
                                  (creates it if needed). Foreground: exits with
                                  cmd's code. With -d: detached/background, tracked
                                  by pid (stop with 'ntree stop'). Remembers cmd.
-  list                           show workspaces, branches, ports, status
-  stop <name>                    stop a detached (run -d) process
+  list                           show the root checkout + workspaces, branches, ports, status
+  stop <name>                    stop the process and free the workspace's ports
+                                 (also kills untracked servers running in its worktree)
   open <name>                    open folder in \$EDITOR / VS Code
   git <name> <args...>           run any git command in the workspace's worktree
   sync-deps [<name>]             refresh deps (re-run setup / re-clone; all if omitted)
-  rm <name> [--force]            stop, remove worktree, delete folder
+  rm <name> [--force]            stop, free ports, remove worktree, delete folder
   allow                          trust this repo's .ntreerc so it gets loaded
   path <name>                    print a workspace's absolute path
   cd <name>                      cd into a workspace (needs shell integration)
