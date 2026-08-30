@@ -23,8 +23,17 @@ NTREE_PORT_RANGE_START=3001
 NTREE_PORT_RANGE_END=3099
 
 # Ports reserved per workspace, exported as PORT, PORT2, PORT3, ... into the
-# run environment. Bump this for apps that need several ports.
+# run environment. Bump this for apps that need several ports (e.g. 2 for a
+# backend + frontend). Override per workspace with `ntree new <b> --ports <n>`.
 NTREE_PORT_COUNT=1
+
+# OPTIONAL friendly port names. When set, its length is the port count (so you
+# don't also need NTREE_PORT_COUNT) and each port gets a <NAME>_PORT alias
+# alongside PORT/PORT2. Great for a typical backend + frontend split:
+#   NTREE_PORTS='API FRONTEND'   → API_PORT + FRONTEND_PORT (and PORT + PORT2)
+# Then in a dev command: 'API_PORT=$API_PORT vite --port $FRONTEND_PORT' (single
+# quotes so it expands at run time). PORT still equals the first port.
+# NTREE_PORTS='API FRONTEND'
 
 # OPT-IN speed hack (leave empty to use NTREE_SETUP_CMD, which is correct):
 # COW-clone these untracked dirs from main into each new workspace instead of

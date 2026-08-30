@@ -22,11 +22,11 @@ _ntree() {
       ;;
     new)
       [[ "$prev" == "--from" ]] && COMPREPLY=( $(compgen -W "$(git branch --format='%(refname:short)' 2>/dev/null)" -- "$cur") )
-      [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--from" -- "$cur") )
+      [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--from --ports" -- "$cur") )
       ;;
     run)
       [[ "$prev" == "--from" ]] && COMPREPLY=( $(compgen -W "$(git branch --format='%(refname:short)' 2>/dev/null)" -- "$cur") )
-      [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--from --rm --detach -d --" -- "$cur") )
+      [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--from --ports --rm --detach -d --" -- "$cur") )
       ;;
   esac
 }

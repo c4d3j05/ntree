@@ -71,15 +71,15 @@ ntree rm feature-login           # tear it down (prompts unless --force)
 
 | Command | Description |
 |---|---|
-| `ntree new <branch> [--from <base>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist. |
+| `ntree new <branch> [--from <base>] [--ports <n>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist. `--ports` overrides how many ports to reserve for this workspace. |
 | `ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): streams + logs output, exits with the command's code; `--rm` tears the workspace down afterward. **`-d`/`--detach`**: runs in the background tracked by pid, for dev servers. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. Logs to `.ntree/<name>/ntree.log`. |
-| `ntree list` | Show workspaces, branches, ports, and live status. |
-| `ntree stop <name>` | Stop a detached (`run -d`) process. |
+| `ntree list` | Show the root checkout plus all workspaces, branches, ports, and live status. |
+| `ntree stop <name>` | Stop the detached (`run -d`) process **and reclaim the workspace's ports** — also kills any server still listening from inside the worktree, on *any* port (e.g. a `npm run dev` you launched by hand, or a dev server that auto-picked its own port). Only TCP listeners are targeted, so a shell you `cd`'d in is spared, as is any listener whose working dir is outside the worktree. |
 | `ntree open <name>` | Open the folder in `$EDITOR` / VS Code / Finder. |
 | `ntree <name>` / `ntree cd <name>` | `cd` into the workspace (needs [shell integration](#shell-integration-optional-for-cd)). `ntree path <name>` prints its path. |
 | `ntree git <name> <args...>` | Run any git command in that workspace's worktree (e.g. `ntree git feature-a status`, `ntree git feature-a push -u origin feature-a`). Exits with git's code. |
 | `ntree sync-deps [<name>]` | Refresh a workspace's deps (or all): re-run `NTREE_SETUP_CMD` and re-clone any `NTREE_CLONE_DIRS`. Use after a lockfile change in `main`. |
-| `ntree rm <name> [--force]` | Stop, remove the worktree, delete the folder. |
+| `ntree rm <name> [--force]` | Stop, kill any server still running in the worktree (same scoped kill as `stop`), remove the worktree, delete the folder. |
 | `ntree doctor` | Verify APFS/git, clear stale locks, prune workspaces whose worktree vanished, flag deleted branches and orphan folders, reconcile PIDs. |
 | `ntree allow` | Trust this repo's `.ntreerc` so it gets loaded (re-run after edits). |
 | `ntree version` | Print the version. |
@@ -101,6 +101,8 @@ NTREE_SETUP_CMD='npm ci'             # run on `new` to install deps (correct per
 NTREE_PORT_RANGE_START=3001          # first port to try
 NTREE_PORT_RANGE_END=3099            # last port to try
 NTREE_PORT_COUNT=1                   # ports reserved per workspace
+# NTREE_PORTS='API FRONTEND'         # optional: name the ports → API_PORT, FRONTEND_PORT
+#                                    #   (its length sets the count; PORT/PORT2 still work)
 # NTREE_CLONE_DIRS='node_modules'    # opt-in: COW-clone deps from main instead of setup
 ```
 
@@ -159,9 +161,12 @@ workspaces don't collide.
   name like `myapp_$NTREE_WORKSPACE`. This is how you keep parallel workspaces
   from colliding on a shared DB/service (ntree gives you the key; wiring it into
   your app/compose is up to you).
-- `PORT`, and `PORT2`, `PORT3`, … when `NTREE_PORT_COUNT > 1` (for apps that
-  need several ports). Ports are re-validated when a `run -d` server launches
-  and reallocated if another process grabbed one in the meantime.
+- `PORT`, and `PORT2`, `PORT3`, … when more than one port is reserved (for apps
+  that need several — e.g. a backend + frontend). Set the count per repo with
+  `NTREE_PORT_COUNT`, or per workspace with `ntree new <branch> --ports <n>`.
+  Name them with `NTREE_PORTS='API FRONTEND'` to also get `API_PORT`/`FRONTEND_PORT`
+  aliases. Ports are re-validated when a `run -d` server launches and reallocated
+  if another process grabbed one in the meantime.
 
 > After a lockfile change in `main`, refresh a workspace with
 > `ntree sync-deps <name>` (re-runs setup / re-clones).
