@@ -61,7 +61,18 @@ NTREE_PORTS=""              # optional friendly port names, e.g. 'API FRONTEND'.
                             # its length is the port count and each port also gets a
                             # <NAME>_PORT alias (API_PORT, FRONTEND_PORT) alongside PORT/PORT2.
 
-rc_hash()       { shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; }
+rc_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" 2>/dev/null | awk '{print $1}'
+  else shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'; fi
+}
+
+# Copy-on-write recursive copy: APFS clonefile on macOS, reflink on Linux
+# (btrfs/XFS/bcachefs). Fails (non-zero) if the filesystem can't clone, so the
+# caller can fall back to a plain copy.
+cow_copy() {
+  if [[ "$(uname -s)" == "Darwin" ]]; then cp -c -R "$1" "$2" 2>/dev/null
+  else cp -R --reflink=always "$1" "$2" 2>/dev/null; fi
+}
 rc_is_allowed() { [[ -f "$ALLOW_FILE" ]] && grep -qxF "$1" "$ALLOW_FILE"; }
 
 init_env() {
@@ -144,7 +155,7 @@ free_ports() {
 
   # All TCP listeners on the machine → their pids.
   local -a lpids
-  lpids=($(lsof -nP -iTCP -sTCP:LISTEN -t 2>/dev/null | sort -u))
+  lpids=($(lsof -nP -iTCP -sTCP:LISTEN -t 2>/dev/null | sort -u || true))  # lsof exits non-zero on Linux when some procs are unreadable
   (( ${#lpids[@]} )) || return 0
 
   # Look up every listener's cwd in ONE lsof call; keep those inside the worktree.
@@ -281,10 +292,10 @@ _provision_ws() {
       warn "  recreate it via NTREE_SETUP_CMD instead (e.g. 'python -m venv $d && $d/bin/pip install -r requirements.txt')"
       continue
     fi
-    if cp -c -R "$src" "$path/$d" 2>/dev/null; then
-      ok "cloned $d (APFS copy-on-write)"; cloned_any=1
+    if cow_copy "$src" "$path/$d"; then
+      ok "cloned $d (copy-on-write)"; cloned_any=1
     else
-      warn "APFS clone failed for $d; falling back to plain copy (uses disk)"
+      warn "copy-on-write clone failed for $d; falling back to plain copy (uses disk)"
       cp -R "$src" "$path/$d"; cloned_any=1
     fi
   done
@@ -425,7 +436,7 @@ _run_detached() {
 
   info "starting (detached): $cmd_str (PORT=$port) → $log"
   # Job control so the background job is its own process-group leader (macOS has
-  # no setsid); then $newpid is a real pgid and `stop` can kill the whole tree.
+  # no setsid; Linux works the same way); then $newpid is a real pgid and `stop` can kill the whole tree.
   set -m
   ( cd "$path" && set -a && . ./.env.workspace && set +a && exec bash -c "$cmd_str" ) >"$log" 2>&1 &
   local newpid=$!
@@ -481,6 +492,7 @@ cmd_open() {
   local path; path="$(state_get ".workspaces[\"$name\"].path")"
   if [[ -n "${EDITOR:-}" ]]; then "$EDITOR" "$path"
   elif command -v code >/dev/null 2>&1; then code "$path"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$path"
   else open "$path"; fi
 }
 
@@ -557,7 +569,7 @@ cmd_sync_deps() {
         warn "  $d is a virtualenv — skipping (use NTREE_SETUP_CMD to recreate it)"; continue
       fi
       rm -rf "$path/$d"
-      if cp -c -R "$src" "$path/$d" 2>/dev/null; then ok "  re-cloned $d"
+      if cow_copy "$src" "$path/$d"; then ok "  re-cloned $d"
       else warn "  APFS clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
     done
     _run_setup "$n" "$path"
@@ -594,11 +606,20 @@ cmd_doctor() {
   else
     warn "git $gv is older than recommended 2.40"; rc=1
   fi
-  if diskutil info / 2>/dev/null | grep -q 'APFS'; then
-    ok "root filesystem is APFS (copy-on-write clones available)"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    if diskutil info / 2>/dev/null | grep -q 'APFS'; then
+      ok "root filesystem is APFS (copy-on-write clones available)"
+    else
+      warn "root filesystem is not APFS — clones fall back to full copies"; rc=1
+    fi
   else
-    warn "root filesystem is not APFS — clones fall back to full copies"; rc=1
+    local fst; fst="$(stat -f -c %T . 2>/dev/null || true)"
+    case "$fst" in
+      btrfs|xfs|bcachefs) ok "filesystem is $fst (reflink clones available)" ;;
+      *) warn "filesystem is '${fst:-unknown}' — reflink clones likely unavailable; clones fall back to full copies (fine if NTREE_CLONE_DIRS is unset)" ;;
+    esac
   fi
+  command -v lsof >/dev/null 2>&1 || { warn "lsof missing (needed to reclaim untracked servers on teardown)"; rc=1; }
   command -v nc >/dev/null 2>&1 && ok "nc present (port probing)" || { warn "nc missing"; rc=1; }
 
   init_env

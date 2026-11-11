@@ -13,7 +13,7 @@
 # When cutting a release, set `url` to the tagged tarball and fill in `sha256`
 # with the output of:  brew fetch ntree  (or shasum -a 256 <tarball>).
 class Ntree < Formula
-  desc "Parallel git worktree workspaces with APFS copy-on-write"
+  desc "Parallel git worktree workspaces with ports and copy-on-write deps"
   homepage "https://github.com/c4d3j05/ntree"
   license "MIT"
   version "0.1.0"
@@ -26,7 +26,7 @@ class Ntree < Formula
 
   depends_on "git"
   depends_on "jq"
-  depends_on :macos # relies on APFS clonefile (cp -c) and diskutil
+  depends_on "lsof" unless OS.mac?
 
   def install
     bin.install "bin/ntree"
