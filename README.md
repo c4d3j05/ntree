@@ -13,7 +13,9 @@ Dependencies are installed **correctly per branch** by your own package manager
 via an optional setup command (`npm ci`, `uv sync`, …). For a big npm/yarn
 `node_modules`, you can opt into instant **APFS copy-on-write** cloning instead.
 
-macOS only (APFS copy-on-write is used for the optional dep cloning).
+Works on macOS and Linux. Optional dep cloning uses APFS copy-on-write on macOS and
+reflinks on Linux (btrfs/XFS/bcachefs); elsewhere it falls back to a plain copy.
+Requires `bash`, `git`, `jq`, `lsof`, and `nc` (netcat).
 
 ## Install
 
@@ -25,6 +27,18 @@ brew install ntree
 # Or bleeding edge, no release required:
 brew install --HEAD c4d3j05/ntree/ntree
 ```
+
+### Linux / manual install
+
+Install `git`, `jq`, `lsof` and `netcat` from your distro, then:
+
+```bash
+git clone https://github.com/c4d3j05/ntree && cd ntree
+sudo make install                   # or: make install PREFIX=$HOME/.local
+```
+
+This installs the binary, bash completion, and `share/ntree/.ntreerc.example`
+(copy it into your repo as `.ntreerc`). Remove with `make uninstall`.
 
 Dependencies (`git`, `jq`) are installed automatically by Homebrew.
 
@@ -46,7 +60,7 @@ workspace. Everything else passes straight through to ntree.
 cd your-repo
 
 # optional: set a setup command (e.g. `npm ci`), ports, default dev command
-cp "$(brew --prefix)/share/ntree/.ntreerc.example" .ntreerc
+cp "$(brew --prefix 2>/dev/null || echo /usr/local)/share/ntree/.ntreerc.example" .ntreerc
 $EDITOR .ntreerc && ntree allow   # .ntreerc is sourced as bash → trust it once
 
 echo ".ntree/" >> .gitignore        # workspaces live here; don't commit them
