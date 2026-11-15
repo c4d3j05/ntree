@@ -744,7 +744,7 @@ _sync_deps_ws() {
     fi
     rm -rf "$path/$d"
     if cow_copy "$src" "$path/$d"; then ok "  re-cloned $d"
-    else warn "  APFS clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
+    else warn "  copy-on-write clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
   done
   _run_setup "$n" "$path"
 }
