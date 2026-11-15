@@ -46,6 +46,7 @@ repo_root() {
 
 # Globals populated by init_env
 REPO_ROOT="" NTREE_DIR="" STATE_FILE="" LOCK_DIR="" RC_FILE="" NTREE_CMD=""
+NEW_BRANCH_TIP=""   # set by _provision_ws when it created the branch (commit it started at)
 
 # Where trusted .ntreerc hashes are recorded (direnv-style allow-list).
 readonly ALLOW_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ntree/allowed"
@@ -485,10 +486,13 @@ _provision_ws() {
   local ports; ports="$(alloc_ports "$count")"
 
   # 1. worktree (create branch if it doesn't exist yet)
+  NEW_BRANCH_TIP=""
   if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    [[ -n "$base" ]] && warn "branch $branch already exists — ignoring --from $base"
     git -C "$REPO_ROOT" worktree add "$path" "$branch" >&2
   else
     git -C "$REPO_ROOT" worktree add -b "$branch" "$path" "${base:-HEAD}" >&2
+    NEW_BRANCH_TIP="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$branch")"
   fi
 
   # 2. Opt-in: COW-clone heavy untracked dirs from main (empty by default)
@@ -605,7 +609,22 @@ cmd_run() {
   local rc=0
   ( cd "$path" && set -a && . ./.env.workspace && set +a && exec bash -c "$cmd_str" ) || rc=$?
 
-  if (( do_rm )); then _remove_ws "$name" "$path"; info "removed workspace $name"; fi
+  if (( do_rm )); then
+    if (( ! created )); then
+      warn "--rm: kept $name — it existed before this run"
+    else
+      _remove_ws "$name" "$path"
+      info "removed workspace $name"
+      # Drop the branch too if this run created it and nothing was committed on it.
+      if [[ -n "$NEW_BRANCH_TIP" ]]; then
+        if [[ "$(git -C "$REPO_ROOT" rev-parse "refs/heads/$branch")" == "$NEW_BRANCH_TIP" ]]; then
+          git -C "$REPO_ROOT" branch -D "$branch" >/dev/null
+        else
+          info "kept branch $branch — it has new commits"
+        fi
+      fi
+    fi
+  fi
   if (( rc == 0 )); then ok "run finished (exit 0)"; else warn "run exited $rc"; fi
   return "$rc"
 }
@@ -873,8 +892,6 @@ cmd_doctor() {
 
   _registry_prune
 
-  # Let git drop bookkeeping for worktrees whose folders are gone.
-  git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 
   # Reconcile state.json against reality: prune missing worktrees, flag deleted
   # branches, clear dead PIDs.
@@ -891,6 +908,8 @@ cmd_doctor() {
       _registry_set "$path"
       warn "pruned '$n' from state — worktree folder missing ($path)"; cleaned=1; continue
     fi
+    # Reconnect the worktree if the repo was moved (git stores absolute paths).
+    git -C "$REPO_ROOT" worktree repair "$path" >/dev/null 2>&1 || true
     _registry_set "$path" $(ws_ports "$n")   # (re)register, e.g. workspaces made by older versions
     if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
       warn "'$n' tracks branch '$branch' which no longer exists"
@@ -904,6 +923,10 @@ cmd_doctor() {
       [[ -n "$issue" ]] && { warn "'$n': $issue"; rc=1; }
     done < <(_link_issues "$n" "$path")
   done <<< "$names"
+
+  # After repairing moved worktrees above, let git drop bookkeeping for ones
+  # whose folders are really gone. (Pruning first would forget moved ones.)
+  git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 
   # Flag folders under .ntree/ that aren't tracked in state (orphan worktrees).
   local d base
@@ -930,11 +953,13 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
                                  create workspace (worktree + ports; runs
                                  NTREE_SETUP_CMD to install deps if set).
                                  --ports overrides how many ports to reserve.
-  run <branch> [-d] [--rm] -- <cmd>
+  run <branch> [-d] [--rm] -- <cmd...>
                                  run a command in the workspace's worktree
                                  (creates it if needed). Foreground: exits with
                                  cmd's code. With -d: detached/background, tracked
                                  by pid (stop with 'ntree stop'). Remembers cmd.
+                                 One arg is a shell string; several run as given.
+                                 --rm removes a workspace (and branch) it created.
   list                           show the root checkout + workspaces, branches, ports, status
   stop <name>                    stop the process and free the workspace's ports
                                  (also kills untracked servers running in its worktree)

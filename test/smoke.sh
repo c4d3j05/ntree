@@ -161,5 +161,53 @@ check "sync keeps the source of a removed link" test -d "$L/notes"
 check "open handles an EDITOR with arguments" \
   bash -c "cd '$G' && EDITOR='echo opened' '$NTREE' open r | grep -q '^opened '"
 
+# --- run --rm cleans up only what it created; --from on an existing branch -------
+check "run --rm removes the workspace and the branch it created" \
+  bash -c "cd '$G' && '$NTREE' run tmp1 --rm -- true && test ! -e .ntree/tmp1 && ! git show-ref --verify --quiet refs/heads/tmp1"
+check "run --rm keeps a branch that got new commits" \
+  bash -c "cd '$G' && '$NTREE' run tmp2 --rm -- 'git -c user.name=t -c user.email=t@t commit -q --allow-empty -m x' && git show-ref --verify --quiet refs/heads/tmp2"
+check "run --rm keeps a workspace that existed before" bash -c "cd '$G' && '$NTREE' run r --rm -- true && test -d .ntree/r"
+git -C "$G" branch exists1
+check "--from on an existing branch warns" bash -c "cd '$G' && '$NTREE' new exists1 --from HEAD 2>&1 | grep -q 'ignoring --from'"
+
+# --- moving the repo -------------------------------------------------------------
+M="$TMP/move"; new_repo "$M"
+( cd "$M" && "$NTREE" new mv1 ) >/dev/null 2>&1
+mv "$M" "$TMP/moved"
+( cd "$TMP/moved" && "$NTREE" doctor ) >/dev/null 2>&1 || true
+check "doctor reconnects worktrees after the repo moves" git -C "$TMP/moved/.ntree/mv1" status
+check "moved workspace keeps its registry entry under the new path" \
+  bash -c "grep -q '/moved/.ntree/mv1\$' '$XDG_STATE_HOME/ntree/ports' && ! grep -q '/move/.ntree/mv1\$' '$XDG_STATE_HOME/ntree/ports'"
+
+# --- background servers: run -d, stop, untracked servers, port reallocation --------
+listening() { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+closed()    { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null || return 0; sleep 0.1; done; return 1; }
+if command -v python3 >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1; then
+  B="$TMP/bg"; new_repo "$B"
+  serve='exec python3 -m http.server $PORT --bind 127.0.0.1'
+  ( cd "$B" && "$NTREE" run s -d -- "$serve" ) >/dev/null 2>&1
+  port="$(jq -r '.workspaces.s.ports[0]' "$B/.ntree/state.json")"
+  check "run -d serves on the workspace's PORT" listening "$port"
+  check "list shows it running" bash -c "cd '$B' && '$NTREE' list 2>&1 | grep '^s ' | grep -q running"
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  check "stop frees the port" closed "$port"
+
+  ( cd "$B/.ntree/s" && exec python3 -m http.server 3950 --bind 127.0.0.1 >/dev/null 2>&1 ) & disown
+  listening 3950 || true
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  check "stop kills an untracked server running in the worktree" closed 3950
+
+  ( cd "$TMP" && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) & squatter=$!; disown
+  listening "$port" || true
+  ( cd "$B" && "$NTREE" run s -d ) >/dev/null 2>&1
+  newport="$(jq -r '.workspaces.s.ports[0]' "$B/.ntree/state.json")"
+  check "run -d moves to a free port if its own was taken" test "$newport" != "$port"
+  check "the moved server is listening" listening "$newport"
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  kill "$squatter" 2>/dev/null || true
+else
+  printf 'skip  background server tests (need python3 and lsof)\n'
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
