@@ -50,6 +50,10 @@ REPO_ROOT="" NTREE_DIR="" STATE_FILE="" LOCK_DIR="" RC_FILE="" NTREE_CMD=""
 # Where trusted .ntreerc hashes are recorded (direnv-style allow-list).
 readonly ALLOW_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ntree/allowed"
 
+# Ports reserved by every ntree workspace on this machine, across repos, so two
+# repos never hand out the same port. One "<port> <workspace path>" per line.
+readonly PORT_REGISTRY="${XDG_STATE_HOME:-$HOME/.local/state}/ntree/ports"
+
 # Config (defaults; overridable via a trusted .ntreerc)
 NTREE_START_CMD=""          # optional default command for `ntree run` (remembered per ws)
 NTREE_SETUP_CMD=""          # optional: run on `new` to install deps correctly for the
@@ -196,11 +200,37 @@ alloc_ports() {
   local -a found=()
   for (( p = NTREE_PORT_RANGE_START; p <= NTREE_PORT_RANGE_END; p++ )); do
     port_in_state "$p" && continue
+    port_in_registry "$p" && continue
     port_listening "$p" && continue
     found+=("$p")
     (( ${#found[@]} == count )) && { echo "${found[*]}"; return 0; }
   done
   die "not enough free ports (need $count) in range $NTREE_PORT_RANGE_START-$NTREE_PORT_RANGE_END"
+}
+
+port_in_registry() { [[ -f "$PORT_REGISTRY" ]] && grep -q "^$1 " "$PORT_REGISTRY"; }
+
+# Record <path>'s ports in the registry, replacing its old entries. With no
+# ports, just drops them. Args: <workspace_path> [port...]
+_registry_set() {
+  local path="$1" p tmp; shift
+  mkdir -p "$(dirname "$PORT_REGISTRY")"
+  tmp="$(mktemp)"
+  {
+    [[ -f "$PORT_REGISTRY" ]] && awk -v w="$path" 'substr($0, index($0, " ") + 1) != w' "$PORT_REGISTRY"
+    for p in "$@"; do printf '%s %s\n' "$p" "$path"; done
+  } > "$tmp"
+  mv "$tmp" "$PORT_REGISTRY"
+}
+
+# Drop registry entries whose workspace folder no longer exists (any repo).
+_registry_prune() {
+  [[ -f "$PORT_REGISTRY" ]] || return 0
+  local line tmp; tmp="$(mktemp)"
+  while IFS= read -r line; do
+    [[ -d "${line#* }" ]] && printf '%s\n' "$line"
+  done < "$PORT_REGISTRY" > "$tmp"
+  mv "$tmp" "$PORT_REGISTRY"
 }
 
 # Echo a workspace's reserved ports, one per line.
@@ -314,12 +344,18 @@ _link_target() {
   printf '%s%s\n' "$up" "$p"
 }
 
-# Create/repair the links in one workspace and keep them git-ignored.
-# Idempotent. Args: <workspace_path>
+# Create/repair the links in one workspace, keep them git-ignored, and remove
+# links for paths no longer listed. Idempotent. Args: <name> <workspace_path>
 _link_ws() {
-  local path="$1" p dst target
-  [[ -n "$NTREE_LINK_PATHS" ]] || return 0
+  local name="$1" path="$2" p dst target current
   _validate_link_paths
+  current="$(_link_paths)"
+  # Linked last time but no longer configured: remove the link, never the source.
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    grep -qxF -- "$p" <<< "$current" && continue
+    [[ -L "$path/$p" ]] && { rm "$path/$p"; ok "unlinked $p"; }
+  done < <(state_get ".workspaces[\"$name\"].links[]?")
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     # A symlink is a file to git, so 'dir/' would never match it: use '/p'.
@@ -337,13 +373,19 @@ _link_ws() {
     mkdir -p "$(dirname "$dst")"
     ln -s "$target" "$dst"
     ok "linked $p"
-  done < <(_link_paths)
+  done <<< "$current"
 }
 
 # Report link problems in one workspace (for doctor). Echoes one issue per line.
-# Args: <workspace_path>
+# Args: <name> <workspace_path>
 _link_issues() {
-  local path="$1" p dst
+  local name="$1" path="$2" p dst current
+  current="$(_link_paths)"
+  while IFS= read -r p; do
+    [[ -n "$p" ]] || continue
+    grep -qxF -- "$p" <<< "$current" && continue
+    [[ -L "$path/$p" ]] && echo "$p: stale link, no longer in NTREE_LINK_PATHS — run 'ntree sync'"
+  done < <(state_get ".workspaces[\"$name\"].links[]?")
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     dst="$path/$p"
@@ -354,7 +396,7 @@ _link_issues() {
     else
       echo "$p: not linked — run 'ntree sync'"
     fi
-  done < <(_link_paths)
+  done <<< "$current"
 }
 
 # ---------------------------------------------------------------------------
@@ -436,8 +478,11 @@ _provision_ws() {
   local name="$1" branch="$2" base="$3" port_override="${4:-}"
   local path; path="$(ws_path "$name")"
 
-  # Fail on a bad NTREE_LINK_PATHS before creating anything.
+  # Validate config and reserve ports before creating anything, so a failure
+  # here leaves no half-made workspace behind.
   _validate_link_paths
+  local count; count="$(_resolve_port_count "$port_override")"
+  local ports; ports="$(alloc_ports "$count")"
 
   # 1. worktree (create branch if it doesn't exist yet)
   if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
@@ -450,20 +495,19 @@ _provision_ws() {
   _clone_dirs "$path" 0
 
   # 2b. symlink NTREE_LINK_PATHS to main's live copies
-  _link_ws "$path"
+  _link_ws "$name" "$path"
 
-  # 3. allocate port(s) + write env (PORT, PORT2, ... + NTREE_WORKSPACE)
-  local count; count="$(_resolve_port_count "$port_override")"
-  local ports; ports="$(alloc_ports "$count")"
+  # 3. write env (PORT, PORT2, ... + NTREE_WORKSPACE)
   _write_env "$path" "$name" $ports
 
   # keep ntree's own files out of `git status` / accidental commits
   _exclude_ntree_files
 
   # 4. register
-  state_update '.workspaces[$n] = {branch:$b, ports:($ports|split(" ")|map(tonumber)), pid:null, created:$ts}' \
-    --arg n "$name" --arg b "$branch" \
+  state_update '.workspaces[$n] = {branch:$b, ports:($ports|split(" ")|map(tonumber)), links:($l|split("\n")|map(select(length > 0))), pid:null, created:$ts}' \
+    --arg n "$name" --arg b "$branch" --arg l "$(_link_paths)" \
     --arg ports "$ports" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  _registry_set "$path" $ports
 }
 
 # Run NTREE_SETUP_CMD in a workspace to install deps (no-op if unset). Runs
@@ -488,17 +532,18 @@ _remove_ws() {
   pid_alive "$pid" && { kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true; }
   free_ports "$path"   # kill any untracked server still running in the worktree
   git -C "$REPO_ROOT" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
+  _registry_set "$path"
   lock
   state_update 'del(.workspaces[$n])' --arg n "$name"
   unlock
 }
 
-# Run a command in a workspace's worktree. Foreground by default (streams output,
-# returns the command's exit code); with -d it runs detached in the background
-# (tracked by PID, stop with `ntree stop`). Creates the workspace if missing.
-# Everything after `--` is run as a shell command line (quote $PORT with single
-# quotes so it expands at run time). Falls back to a remembered command, then to
-# NTREE_START_CMD, when none is given.
+# Run a command in a workspace's worktree. Foreground by default (attached to
+# your terminal, returns the command's exit code); with -d it runs detached in
+# the background, logged to ntree.log (stop with `ntree stop`). Creates the
+# workspace if missing. After `--`, a single argument is a shell string ('npm run
+# dev -- --port $PORT' expands $PORT at run time); several arguments run exactly
+# as given. Falls back to a remembered command, then to NTREE_START_CMD.
 cmd_run() {
   local branch="" base="" do_rm=0 detach=0 ports=""
   local -a cmd=()
@@ -533,8 +578,12 @@ cmd_run() {
 
   # Resolve the command: explicit `-- cmd` (remembered) > remembered > NTREE_START_CMD
   local cmd_str=""
-  if (( ${#cmd[@]} > 0 )); then
-    cmd_str="${cmd[*]}"
+  if (( ${#cmd[@]} == 1 )); then
+    cmd_str="${cmd[0]}"
+  elif (( ${#cmd[@]} > 1 )); then
+    cmd_str="$(printf '%q ' "${cmd[@]}")"; cmd_str="${cmd_str% }"
+  fi
+  if [[ -n "$cmd_str" ]]; then
     lock; state_update '.workspaces[$n].cmd = $c' --arg n "$name" --arg c "$cmd_str"; unlock
   else
     cmd_str="$(state_get ".workspaces[\"$name\"].cmd // empty")"
@@ -552,11 +601,9 @@ cmd_run() {
                 || info "reusing workspace $name (branch $branch)"
   info "running (PORT=$port): $cmd_str"
 
+  # No pipe through tee here: the command keeps your terminal (colors, prompts).
   local rc=0
-  set +e +o pipefail
-  ( cd "$path" && set -a && . ./.env.workspace && set +a && bash -c "$cmd_str" ) 2>&1 | tee -a "$log"
-  rc=${PIPESTATUS[0]}
-  set -e -o pipefail
+  ( cd "$path" && set -a && . ./.env.workspace && set +a && exec bash -c "$cmd_str" ) || rc=$?
 
   if (( do_rm )); then _remove_ws "$name" "$path"; info "removed workspace $name"; fi
   if (( rc == 0 )); then ok "run finished (exit 0)"; else warn "run exited $rc"; fi
@@ -580,6 +627,7 @@ _run_detached() {
     _write_env "$path" "$name" $newports
     state_update '.workspaces[$n].ports = ($p|split(" ")|map(tonumber))' \
       --arg n "$name" --arg p "$newports"
+    _registry_set "$path" $newports
     unlock
   fi
   local port; port="$(state_get ".workspaces[\"$name\"].ports[0]")"
@@ -640,7 +688,9 @@ cmd_open() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree open <name>"
   init_env; require_ws "$name"
   local path; path="$(ws_path "$name")"
-  if [[ -n "${EDITOR:-}" ]]; then "$EDITOR" "$path"
+  if [[ -n "${EDITOR:-}" ]]; then
+    local -a editor; read -ra editor <<< "$EDITOR"     # may carry flags, e.g. 'code -w'
+    "${editor[@]}" "$path"
   elif command -v code >/dev/null 2>&1; then code "$path"
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$path"
   else open "$path"; fi
@@ -709,47 +759,47 @@ cmd_allow() {
   ok "trusted .ntreerc — it will now be loaded (re-run 'ntree allow' after edits)"
 }
 
-# Bring one workspace, or all, up to date with main's untracked state.
-#   sync       re-link NTREE_LINK_PATHS, then refresh deps
-#   sync-deps  refresh deps only: re-clone NTREE_CLONE_DIRS, re-run NTREE_SETUP_CMD
-# Use after editing .ntreerc or after a lockfile change in main.
-cmd_sync()      { _sync all "$@"; }
-cmd_sync_deps() { _sync deps "$@"; }
-
-# Args: all|deps [<name>]
-_sync() {
-  local mode="$1" target="${2:-}" names
-  if [[ -n "$target" ]]; then require_ws "$target"; names="$target"
-  else names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"; fi
-  [[ -n "$names" ]] || { info "no workspaces to sync"; return; }
-  local links=0 deps=0
-  [[ "$mode" == all && -n "$NTREE_LINK_PATHS" ]] && links=1
-  [[ -n "${NTREE_CLONE_DIRS:-}" || -n "${NTREE_SETUP_CMD:-}" ]] && deps=1
-  if (( ! links && ! deps )); then
-    if [[ "$mode" == all ]]; then
-      warn "nothing to sync — set NTREE_LINK_PATHS, NTREE_SETUP_CMD or NTREE_CLONE_DIRS in .ntreerc"
-    else
-      warn "nothing to sync — set NTREE_SETUP_CMD (e.g. 'npm ci') or NTREE_CLONE_DIRS in .ntreerc"
-    fi
-    return
-  fi
-  local n
-  while IFS= read -r n; do
-    [[ -z "$n" ]] && continue
-    local path; path="$(ws_path "$n")"
-    [[ -d "$path" ]] || { warn "$n: worktree folder missing — skipping (run 'ntree doctor')"; continue; }
-    info "syncing $n"
-    (( links )) && _link_ws "$path"
-    (( deps )) && _sync_deps_ws "$n" "$path"
-  done <<< "$names"
-  return 0
+# Echo the target workspace (validated), or all workspaces. Args: [<name>]
+_target_names() {
+  if [[ -n "${1:-}" ]]; then require_ws "$1"; echo "$1"
+  else state_get '.workspaces | keys[]'; fi
 }
 
-# Re-clone NTREE_CLONE_DIRS and re-run NTREE_SETUP_CMD in one workspace.
-# Args: <name> <path>
-_sync_deps_ws() {
-  _clone_dirs "$2" 1
-  _run_setup "$1" "$2"
+# Create/repair linked paths and remove ones no longer listed. Cheap; run it
+# after editing NTREE_LINK_PATHS. Args: [<name>] (default: all workspaces)
+cmd_sync() {
+  local names n path; names="$(_target_names "${1:-}")"
+  [[ -n "$names" ]] || { info "no workspaces to sync"; return 0; }
+  if [[ -z "$NTREE_LINK_PATHS" && "$(state_get '[.workspaces[].links[]?] | length')" == 0 ]]; then
+    warn "nothing to sync — set NTREE_LINK_PATHS in .ntreerc (for dependencies use 'ntree sync-deps')"
+    return 0
+  fi
+  while IFS= read -r n; do
+    path="$(ws_path "$n")"
+    [[ -d "$path" ]] || { warn "$n: worktree folder missing — skipping (run 'ntree doctor')"; continue; }
+    _link_ws "$n" "$path"
+    lock
+    state_update '.workspaces[$n].links = ($l|split("\n")|map(select(length > 0)))' --arg n "$n" --arg l "$(_link_paths)"
+    unlock
+  done <<< "$names"
+}
+
+# Refresh dependencies: re-clone NTREE_CLONE_DIRS, then re-run NTREE_SETUP_CMD.
+# Use after a lockfile change in main. Args: [<name>] (default: all workspaces)
+cmd_sync_deps() {
+  local names n path; names="$(_target_names "${1:-}")"
+  [[ -n "$names" ]] || { info "no workspaces to sync"; return 0; }
+  if [[ -z "${NTREE_CLONE_DIRS:-}" && -z "${NTREE_SETUP_CMD:-}" ]]; then
+    warn "nothing to sync — set NTREE_SETUP_CMD (e.g. 'npm ci') or NTREE_CLONE_DIRS in .ntreerc"
+    return 0
+  fi
+  while IFS= read -r n; do
+    path="$(ws_path "$n")"
+    [[ -d "$path" ]] || { warn "$n: worktree folder missing — skipping (run 'ntree doctor')"; continue; }
+    info "syncing deps into $n"
+    _clone_dirs "$path" 1
+    _run_setup "$n" "$path"
+  done <<< "$names"
 }
 
 cmd_rm() {
@@ -762,13 +812,18 @@ cmd_rm() {
   done
   [[ -n "$name" ]] || die "usage: ntree rm <name> [--force]"
   init_env; require_ws "$name"
+  local path; path="$(ws_path "$name")"
 
   if (( ! force )); then
+    local dirty; dirty="$(git -C "$path" status --porcelain 2>/dev/null || true)"
+    if [[ -n "$dirty" ]]; then
+      printf '%s\n' "$dirty" >&2
+      die "$name has uncommitted changes (above) — commit or stash them, or discard them with 'ntree rm $name --force'"
+    fi
     printf 'Remove workspace %s and its folder? [y/N] ' "$name" >&2
     read -r reply; [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted"; return; }
   fi
 
-  local path; path="$(ws_path "$name")"
   _remove_ws "$name" "$path"
   ok "removed workspace $name"
 }
@@ -816,6 +871,8 @@ cmd_doctor() {
 
   [[ -d "$NTREE_DIR" ]] && _exclude_ntree_files
 
+  _registry_prune
+
   # Let git drop bookkeeping for worktrees whose folders are gone.
   git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 
@@ -831,8 +888,10 @@ cmd_doctor() {
     pid="$(state_get ".workspaces[\"$n\"].pid")"
     if [[ ! -d "$path" ]]; then
       lock; state_update 'del(.workspaces[$n])' --arg n "$n"; unlock
+      _registry_set "$path"
       warn "pruned '$n' from state — worktree folder missing ($path)"; cleaned=1; continue
     fi
+    _registry_set "$path" $(ws_ports "$n")   # (re)register, e.g. workspaces made by older versions
     if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
       warn "'$n' tracks branch '$branch' which no longer exists"
     fi
@@ -843,7 +902,7 @@ cmd_doctor() {
     local issue
     while IFS= read -r issue; do
       [[ -n "$issue" ]] && { warn "'$n': $issue"; rc=1; }
-    done < <(_link_issues "$path")
+    done < <(_link_issues "$n" "$path")
   done <<< "$names"
 
   # Flag folders under .ntree/ that aren't tracked in state (orphan worktrees).
@@ -881,10 +940,11 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
                                  (also kills untracked servers running in its worktree)
   open <name>                    open folder in \$EDITOR / VS Code
   git <name> <args...>           run any git command in the workspace's worktree
-  sync [<name>]                  re-link NTREE_LINK_PATHS, then refresh deps
+  sync [<name>]                  create/repair linked paths, remove unlisted ones
                                  (all workspaces if omitted)
-  sync-deps [<name>]             refresh deps only (re-run setup / re-clone)
+  sync-deps [<name>]             refresh deps (re-clone, re-run setup)
   rm <name> [--force]            stop, free ports, remove worktree, delete folder
+                                 (refuses uncommitted changes unless --force)
   allow                          trust this repo's .ntreerc so it gets loaded
   path <name>                    print a workspace's absolute path
   cd <name>                      cd into a workspace (needs shell integration)

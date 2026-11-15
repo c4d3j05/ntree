@@ -6,6 +6,7 @@ NTREE="$(cd "$(dirname "$0")/.." && pwd)/bin/ntree"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export XDG_CONFIG_HOME="$TMP/config"   # keep the .ntreerc allow-list out of the real one
+export XDG_STATE_HOME="$TMP/state"     # and the machine-wide port registry
 
 pass=0 fail=0
 check() {  # check <description> <command...>
@@ -106,6 +107,59 @@ echo v2 > "$C/deps/x"; echo local > "$C/.ntree/c1/tdir/f"
 ( cd "$C" && "$NTREE" sync-deps c1 ) >/dev/null 2>&1
 check "sync-deps refreshes a clone dir" grep -qx v2 "$C/.ntree/c1/deps/x"
 check "sync-deps never replaces a dir the branch tracks" grep -qx local "$C/.ntree/c1/tdir/f"
+
+# --- rm guards uncommitted work ---------------------------------------------------
+D="$TMP/dirty"; new_repo "$D"
+( cd "$D" && "$NTREE" new d1 ) >/dev/null 2>&1
+echo wip > "$D/.ntree/d1/wip.txt"
+check "rm refuses a workspace with uncommitted changes" fails bash -c "cd '$D' && echo y | '$NTREE' rm d1"
+check "refused rm keeps the work" test -f "$D/.ntree/d1/wip.txt"
+check "rm --force discards it" bash -c "cd '$D' && '$NTREE' rm d1 --force && test ! -e '$D/.ntree/d1'"
+
+# --- no half-made workspace when ports run out --------------------------------------
+P="$TMP/ports"; new_repo "$P"
+echo '.ntreerc' >> "$P/.git/info/exclude"
+printf 'NTREE_PORT_RANGE_START=3901\nNTREE_PORT_RANGE_END=3901\n' > "$P/.ntreerc"; ( cd "$P" && "$NTREE" allow ) >/dev/null 2>&1
+( cd "$P" && "$NTREE" new p1 ) >/dev/null 2>&1
+check "new fails when no port is free" fails bash -c "cd '$P' && '$NTREE' new p2"
+check "failed new creates no worktree" test ! -e "$P/.ntree/p2"
+check "failed new creates no branch" fails git -C "$P" show-ref --verify --quiet refs/heads/p2
+
+# --- ports are unique across repos ---------------------------------------------------
+P2="$TMP/ports2"; new_repo "$P2"
+echo '.ntreerc' >> "$P2/.git/info/exclude"; cp "$P/.ntreerc" "$P2/.ntreerc"
+check "another repo can't take a port reserved elsewhere" fails bash -c "cd '$P2' && '$NTREE' new q1"
+( cd "$P" && "$NTREE" rm p1 --force ) >/dev/null 2>&1
+check "rm releases the port machine-wide" bash -c "cd '$P2' && '$NTREE' new q1"
+
+# --- run: argument handling + terminal -------------------------------------------
+G="$TMP/run"; new_repo "$G"
+check "several args run exactly as given" \
+  bash -c "cd '$G' && '$NTREE' run r -- printf '[%s]' 'two words' 2>/dev/null | grep -qxF '[two words]'"
+check "one arg is a shell string (\$PORT expands)" \
+  bash -c "cd '$G' && '$NTREE' run r -- 'echo port=\$PORT' 2>/dev/null | grep -qE '^port=[0-9]+$'"
+check "bare run reuses the remembered command" \
+  bash -c "cd '$G' && '$NTREE' run r 2>/dev/null | grep -qE '^port=[0-9]+$'"
+foreground_has_tty() {  # run under a pseudo-terminal (BSD vs util-linux script)
+  local line="cd '$G' && '$NTREE' run r -- 'test -t 1 && echo has-tty'" out
+  if [[ "$(uname -s)" == Darwin ]]; then out="$(script -q /dev/null bash -c "$line" </dev/null 2>/dev/null)"
+  else out="$(script -qec "$line" /dev/null </dev/null 2>/dev/null)"; fi
+  [[ "$out" == *has-tty* ]]
+}
+check "foreground run keeps the terminal" foreground_has_tty
+
+# --- linked path removed from config -------------------------------------------------
+set_links 'ctx notes'
+( cd "$L" && "$NTREE" new w5 ) >/dev/null 2>&1
+set_links 'ctx'
+check "doctor flags a stale link" bash -c "cd '$L' && '$NTREE' doctor 2>&1 | grep -q 'notes: stale link'"
+( cd "$L" && "$NTREE" sync w5 ) >/dev/null 2>&1
+check "sync removes the stale link" test ! -e "$L/.ntree/w5/notes"
+check "sync keeps the source of a removed link" test -d "$L/notes"
+
+# --- open: EDITOR with flags ---------------------------------------------------------
+check "open handles an EDITOR with arguments" \
+  bash -c "cd '$G' && EDITOR='echo opened' '$NTREE' open r | grep -q '^opened '"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
