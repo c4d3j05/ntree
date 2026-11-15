@@ -58,5 +58,47 @@ check "doctor leaves no glued line behind" fails grep -q '.\.env\.workspace$' "$
 ( cd "$R" && "$NTREE" rm feat-a --force ) >/dev/null 2>&1
 check "rm removes the worktree" test ! -e "$R/.ntree/feat-a"
 
+# --- linked paths ----------------------------------------------------------------
+L="$TMP/linked"; new_repo "$L"
+echo t > "$L/tracked.md"; git -C "$L" add tracked.md
+git -C "$L" -c user.name=t -c user.email=t@t commit -q -m tracked
+echo '.ntreerc' >> "$L/.git/info/exclude"
+mkdir -p "$L/ctx" "$L/.claude"; echo spec > "$L/ctx/a.md"; echo '{}' > "$L/.claude/settings.local.json"
+set_links() {  # set_links <NTREE_LINK_PATHS> [extra .ntreerc line]
+  printf "NTREE_LINK_PATHS='%s'\n%s\n" "$1" "${2:-}" > "$L/.ntreerc"
+  ( cd "$L" && "$NTREE" allow ) >/dev/null 2>&1
+}
+set_links 'ctx .claude/settings.local.json'
+( cd "$L" && "$NTREE" new w1 ) >/dev/null 2>&1
+W="$L/.ntree/w1"
+check "dir is linked with a relative target" test "$(readlink "$W/ctx")" = "../../ctx"
+check "nested file is linked with a relative target" \
+  test "$(readlink "$W/.claude/settings.local.json")" = "../../../.claude/settings.local.json"
+echo edit >> "$W/ctx/a.md"
+check "edits through a link land in main" grep -qx edit "$L/ctx/a.md"
+check "worktree status is clean with links" test -z "$(git -C "$W" status --porcelain)"
+check "main status is clean with linked sources" test -z "$(git -C "$L" status --porcelain)"
+
+mkdir "$L/notes"
+set_links 'ctx .claude/settings.local.json notes'
+( cd "$L" && "$NTREE" sync w1 ) >/dev/null 2>&1
+check "sync links a path added after creation" test -L "$W/notes"
+
+mv "$L/ctx" "$L/ctx.bak"
+check "doctor flags a broken link" bash -c "cd '$L' && '$NTREE' doctor 2>&1 | grep -q 'ctx: broken link'"
+mv "$L/ctx.bak" "$L/ctx"
+
+set_links 'tracked.md'
+check "tracked path is refused" fails bash -c "cd '$L' && '$NTREE' new w2"
+check "refused new leaves no worktree" test ! -e "$L/.ntree/w2"
+set_links 'ctx' "NTREE_CLONE_DIRS='ctx'"
+check "path in both link and clone lists is refused" fails bash -c "cd '$L' && '$NTREE' new w3"
+set_links '../outside'
+check "path escaping the repo is refused" fails bash -c "cd '$L' && '$NTREE' new w4"
+
+set_links 'ctx'
+( cd "$L" && "$NTREE" rm w1 --force ) >/dev/null 2>&1
+check "rm keeps the link source" test -f "$L/ctx/a.md"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

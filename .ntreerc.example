@@ -41,3 +41,9 @@ NTREE_PORT_COUNT=1
 # big npm/yarn node_modules. Never list .venv (absolute paths) or a pnpm/Bun
 # node_modules (already globally deduped).
 # NTREE_CLONE_DIRS='node_modules'
+
+# Untracked files/dirs every workspace should share LIVE (not a snapshot): each
+# workspace gets a symlink to the copy in the main checkout, git-ignored as
+# '/<path>'. For notes, agent context, a gitignored .env, local settings. Tracked
+# paths are refused (git already shares those). Run `ntree sync` after editing.
+# NTREE_LINK_PATHS='notes .claude/settings.local.json'

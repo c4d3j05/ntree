@@ -13,7 +13,7 @@ _ntree() {
   fi
 
   case "${COMP_WORDS[1]}" in
-    stop|open|git|sync-deps|path|cd|rm)
+    stop|open|git|sync|sync-deps|path|cd|rm)
       [[ $COMP_CWORD -eq 2 ]] && COMPREPLY=( $(compgen -W "$(command ntree __complete workspaces)" -- "$cur") )
       ;;
     new)
