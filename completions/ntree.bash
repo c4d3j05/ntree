@@ -1,4 +1,5 @@
 # bash completion for ntree
+# shellcheck disable=SC2207  # COMPREPLY=( $(compgen ...) ) is the standard idiom; mapfile isn't in bash 3.2
 # Commands and workspace names come from `ntree __complete`, so this file never
 # drifts from the CLI and works from inside a worktree too.
 _ntree() {

@@ -180,8 +180,8 @@ check "moved workspace keeps its registry entry under the new path" \
   bash -c "grep -q '/moved/.ntree/mv1\$' '$XDG_STATE_HOME/ntree/ports' && ! grep -q '/move/.ntree/mv1\$' '$XDG_STATE_HOME/ntree/ports'"
 
 # --- background servers: run -d, stop, untracked servers, port reallocation --------
-listening() { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
-closed()    { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null || return 0; sleep 0.1; done; return 1; }
+listening() { local _; for _ in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+closed()    { local _; for _ in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null || return 0; sleep 0.1; done; return 1; }
 if command -v python3 >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1; then
   B="$TMP/bg"; new_repo "$B"
   serve='exec python3 -m http.server $PORT --bind 127.0.0.1'

@@ -188,8 +188,9 @@ free_ports() {
   command -v lsof >/dev/null 2>&1 || return 0
 
   # All TCP listeners on the machine → their pids.
-  local -a lpids
-  lpids=($(lsof -nP -iTCP -sTCP:LISTEN -t 2>/dev/null | sort -u || true))  # lsof exits non-zero on Linux when some procs are unreadable
+  # (lsof exits non-zero on Linux when some procs are unreadable; that's fine.)
+  local -a lpids=(); local lp
+  while IFS= read -r lp; do lpids+=("$lp"); done < <(lsof -nP -iTCP -sTCP:LISTEN -t 2>/dev/null | sort -u)
   (( ${#lpids[@]} )) || return 0
 
   # Look up every listener's cwd in ONE lsof call; keep those inside the worktree.
@@ -205,7 +206,8 @@ free_ports() {
   done < <(lsof -a -d cwd -p "$pidcsv" -Fpn 2>/dev/null)
 
   (( ${#doomed[@]} )) || return 0
-  local -a uniq; uniq=($(printf '%s\n' "${doomed[@]}" | sort -u)); local d
+  local -a uniq=(); local d
+  while IFS= read -r d; do uniq+=("$d"); done < <(printf '%s\n' "${doomed[@]}" | sort -u)
   for d in "${uniq[@]}"; do kill "$d" 2>/dev/null || true; done
   sleep 0.3
   for d in "${uniq[@]}"; do pid_alive "$d" && kill -9 "$d" 2>/dev/null || true; done
@@ -260,7 +262,7 @@ ws_ports() { ws_get "$1" '.ports[]'; }
 _resolve_port_count() {
   local override="${1:-}"
   [[ -n "$override" ]] && { echo "$override"; return; }
-  local -a names=($NTREE_PORTS)
+  local -a names; read -ra names <<< "$NTREE_PORTS"
   (( ${#names[@]} > 0 )) && { echo "${#names[@]}"; return; }
   echo "$NTREE_PORT_COUNT"
 }
@@ -271,7 +273,7 @@ _resolve_port_count() {
 _write_env() {
   local path="$1" name="$2"; shift 2
   local pf="$path/.env.workspace" i=1 p
-  local -a names=($NTREE_PORTS)            # optional friendly names, positional
+  local -a names; read -ra names <<< "$NTREE_PORTS"   # optional friendly names, positional
   echo "NTREE_WORKSPACE=$name" > "$pf"     # stable per-workspace key for DB/service isolation
   for p in "$@"; do
     if (( i == 1 )); then echo "PORT=$p" >> "$pf"; else echo "PORT$i=$p" >> "$pf"; fi
@@ -485,13 +487,13 @@ _clone_dirs() {
     fi
     if [[ -e "$path/$d" ]]; then
       (( refresh )) || continue
-      rm -rf "$path/$d"
+      rm -rf "${path:?}/$d"
     fi
     if cow_copy "$src" "$path/$d"; then ok "cloned $d (copy-on-write)"
     else
       # A failed clone can leave a partial copy; clear it or cp -R nests inside it.
       warn "copy-on-write clone failed for $d; plain copy (uses disk)"
-      rm -rf "$path/$d"; cp -R "$src" "$path/$d"
+      rm -rf "${path:?}/$d"; cp -R "$src" "$path/$d"
     fi
     cloned=1
   done
@@ -550,8 +552,8 @@ _build_ws() {
     fi
     _clone_dirs "$path" 0
     _link_ws "$name" "$path"
-    local -a ports; read -ra ports <<< "$(ws_ports "$name" | tr '\n' ' ')"
-    _write_env "$path" "$name" "${ports[@]}"
+    local -a wsports; read -ra wsports <<< "$(ws_ports "$name" | tr '\n' ' ')"
+    _write_env "$path" "$name" "${wsports[@]}"
     _exclude_ntree_files
   )
   rc=$?
@@ -974,7 +976,9 @@ cmd_doctor() {
     fi
     # Reconnect the worktree if the repo was moved (git stores absolute paths).
     git -C "$REPO_ROOT" worktree repair "$path" >/dev/null 2>&1 || true
-    _registry_set "$path" $(ws_ports "$n")   # (re)register, e.g. workspaces made by older versions
+    # (re)register, e.g. workspaces made by older versions
+    local -a wsports; read -ra wsports <<< "$(ws_ports "$n" | tr '\n' ' ')"
+    _registry_set "$path" ${wsports[@]+"${wsports[@]}"}
     if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
       warn "'$n' tracks branch '$branch' which no longer exists"
     fi
@@ -1050,8 +1054,8 @@ EOF
 }
 
 main() {
-  local cmd="${1:-help}"; NTREE_CMD="$cmd"; shift || true
-  case "$cmd" in
+  local sub="${1:-help}"; NTREE_CMD="$sub"; shift || true
+  case "$sub" in
     new)     init_env; cmd_new "$@" ;;
     run)     init_env; cmd_run "$@" ;;
     list|ls) init_env; cmd_list "$@" ;;
@@ -1069,7 +1073,7 @@ main() {
     doctor)  cmd_doctor "$@" ;;
     version|--version|-v) echo "ntree $NTREE_VERSION" ;;
     help|--help|-h) usage ;;
-    *) usage; die "unknown command: $cmd" ;;
+    *) usage; die "unknown command: $sub" ;;
   esac
 }
 

@@ -91,8 +91,8 @@ ntree rm feature-login           # tear it down (refuses uncommitted changes unl
 
 | Command | Description |
 |---|---|
-| `ntree new <branch> [--from <base>] [--ports <n>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist. `--ports` overrides how many ports to reserve for this workspace. |
-| `ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. |
+| `ntree new <branch> [--from <base>] [--ports <n>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist, starting from the repo's default branch (`origin/HEAD`, else `main`/`master`) unless `--from` says otherwise. `--ports` overrides how many ports to reserve for this workspace. |
+| `ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it, and also when you Ctrl-C it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. |
 | `ntree list` | Show the root checkout plus all workspaces, branches, ports, and live status. |
 | `ntree stop <name>` | Stop the detached (`run -d`) process **and reclaim the workspace's ports** — also kills any server still listening from inside the worktree, on *any* port (e.g. a `npm run dev` you launched by hand, or a dev server that auto-picked its own port). Only TCP listeners are targeted, so a shell you `cd`'d in is spared, as is any listener whose working dir is outside the worktree. |
 | `ntree open <name>` | Open the folder in `$EDITOR` / VS Code / Finder. |
@@ -264,6 +264,7 @@ repo/               # your main checkout
 
 ```bash
 make test             # syntax check + end-to-end checks against throwaway repos
+make lint             # shellcheck (CI runs both)
 ./bin/ntree doctor    # environment check
 
 # run your working copy instead of the Homebrew build
