@@ -259,15 +259,78 @@ check "failed build leaves no state entry" bash -c "! jq -e '.workspaces.broken'
 
 # --- Ctrl-C during run --rm still cleans up --------------------------------------
 if command -v python3 >/dev/null 2>&1; then
-  python3 - "$NTREE" "$G" <<'EOF'
+  # ctrl_c_when <marker> <dir> <cmd...>: start cmd in its own process group,
+  # wait until <marker> exists (no fixed sleeps: CI machines are slow), then
+  # Ctrl-C the whole group like a terminal would.
+  ctrl_c_when() {
+    python3 - "$@" <<'EOF'
 import os, signal, subprocess, sys, time
-p = subprocess.Popen([sys.argv[1], "run", "intr", "--rm", "--", "sleep 30"], cwd=sys.argv[2],
-                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-time.sleep(3); os.killpg(p.pid, signal.SIGINT); p.wait(timeout=20)
+marker, cwd, cmd = sys.argv[1], sys.argv[2], sys.argv[3:]
+p = subprocess.Popen(cmd, cwd=cwd, start_new_session=True,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+deadline = time.time() + 60
+while not os.path.exists(marker) and time.time() < deadline and p.poll() is None:
+    time.sleep(0.05)
+time.sleep(0.2); os.killpg(p.pid, signal.SIGINT); p.wait(timeout=30)
 EOF
+  }
+  ctrl_c_when "$TMP/intr-started" "$G" "$NTREE" run intr --rm -- "touch '$TMP/intr-started'; sleep 30"
   check "interrupted run --rm removes its workspace" test ! -e "$G/.ntree/intr"
   check "interrupted run --rm removes its branch" fails git -C "$G" show-ref --verify --quiet refs/heads/intr
+
+  # Ctrl-C after the workspace is built but before the command starts (during setup).
+  Q="$TMP/setupintr"; new_repo "$Q"; echo '.ntreerc' >> "$Q/.git/info/exclude"
+  printf 'NTREE_SETUP_CMD=%q\n' "touch '$TMP/setup-started'; sleep 30" > "$Q/.ntreerc"
+  ( cd "$Q" && "$NTREE" allow ) >/dev/null 2>&1 || true
+  ctrl_c_when "$TMP/setup-started" "$Q" "$NTREE" run sx --rm -- true
+  check "Ctrl-C during setup of run --rm removes the workspace" test ! -e "$Q/.ntree/sx"
+  check "Ctrl-C during setup of run --rm removes the branch" fails git -C "$Q" show-ref --verify --quiet refs/heads/sx
 fi
+
+# --- two repos allocating ports at the same moment ----------------------------------
+X1="$TMP/xr1"; X2="$TMP/xr2"; new_repo "$X1"; new_repo "$X2"
+for i in 1 2 3 4 5 6; do
+  ( cd "$X1" && "$NTREE" new "a$i" >/dev/null 2>&1 ) &
+  ( cd "$X2" && "$NTREE" new "b$i" >/dev/null 2>&1 ) &
+done; wait
+check "parallel new in two repos never shares a port" \
+  test -z "$( { jq -r '.workspaces[].ports[]' "$X1/.ntree/state.json"; jq -r '.workspaces[].ports[]' "$X2/.ntree/state.json"; } | sort | uniq -d)"
+
+# --- Ctrl-C during new rolls back -------------------------------------------------
+if command -v python3 >/dev/null 2>&1; then
+  # the slow cp marks when the build is under way
+  printf '#!/bin/sh\ntouch %q; sleep 30; exec %s "$@"\n' "$TMP/build-started" "$realcp" > "$TMP/slowbin/cp"
+  PATH="$TMP/slowbin:$PATH" ctrl_c_when "$TMP/build-started" "$W" "$NTREE" new intr
+  check "Ctrl-C during new leaves no worktree" test ! -e "$W/.ntree/intr"
+  check "Ctrl-C during new leaves no state entry" bash -c "! jq -e '.workspaces.intr' '$W/.ntree/state.json' >/dev/null"
+  check "Ctrl-C during new leaves no branch" fails git -C "$W" show-ref --verify --quiet refs/heads/intr
+fi
+
+# --- sync refuses an untrusted .ntreerc instead of dropping every link ----------
+set_links 'ctx'
+( cd "$L" && "$NTREE" new t1 ) >/dev/null 2>&1 || true
+echo '# edited' >> "$L/.ntreerc"
+check "sync refuses while .ntreerc is untrusted" fails bash -c "cd '$L' && '$NTREE' sync"
+check "and the links are still there" test -L "$L/.ntree/t1/ctx"
+( cd "$L" && "$NTREE" allow ) >/dev/null 2>&1 || true
+
+# --- a branch checked out elsewhere; list shows the real branch -------------------
+git -C "$V" branch side
+git -C "$V/.ntree/nb" switch -q side
+check "list shows the branch actually checked out" bash -c "cd '$V' && '$NTREE' list | grep '^nb ' | grep -q ' side '"
+check "doctor mentions the switch" bash -c "cd '$V' && '$NTREE' doctor 2>&1 | grep -q \"'nb' was created for nb but is on side\""
+check "new for a branch checked out in a workspace names that workspace" \
+  bash -c "cd '$V' && '$NTREE' new side 2>&1 | grep -q \"ntree cd nb\""
+
+# --- corrupt state: commands stop, doctor rebuilds it ------------------------------
+before="$(jq -cS '[.workspaces | to_entries[] | {k: .key, p: .value.ports}] | sort_by(.k)' "$V/.ntree/state.json")"
+printf '{"workspaces": {"nb": {"bra' > "$V/.ntree/state.json"
+check "list refuses a corrupt state file" bash -c "cd '$V' && '$NTREE' list 2>&1 | grep -q 'unreadable'"
+check "new refuses a corrupt state file" fails bash -c "cd '$V' && '$NTREE' new never"
+( cd "$V" && "$NTREE" doctor ) >/dev/null 2>&1 || true
+after="$(jq -cS '[.workspaces | to_entries[] | {k: .key, p: .value.ports}] | sort_by(.k)' "$V/.ntree/state.json" 2>/dev/null || true)"
+check "doctor rebuilds the same workspaces and ports" test "$before" = "$after"
+check "doctor keeps the corrupt copy" bash -c "ls '$V/.ntree/' | grep -q 'state.json.corrupt-'"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
