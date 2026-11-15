@@ -185,12 +185,27 @@ lock() {
 }
 unlock() { _release "$LOCK_DIR"; }
 
+# Can the port registry's folder be used? Sets REG_PROBLEM to why not (with the
+# fix), or to "" when it can. Checked once per run.
+REG_PROBLEM="?"
+_check_state_dir() {
+  [[ "$REG_PROBLEM" == "?" ]] || return 0
+  local dir p owner; dir="$(dirname "$PORT_REGISTRY")"
+  if mkdir -p "$dir" 2>/dev/null && [[ -w "$dir" ]]; then REG_PROBLEM=""; return 0; fi
+  p="$dir"
+  while [[ ! -e "$p" && "$p" != / ]]; do p="$(dirname "$p")"; done
+  owner="$(stat -f %Su "$p" 2>/dev/null || stat -c %U "$p" 2>/dev/null || echo unknown)"
+  REG_PROBLEM="can't write ntree's port registry in $dir: $p belongs to $owner, not you. Fix: sudo chown $USER $p (or set XDG_STATE_HOME to a folder you own)"
+}
+
 # The port registry lock. Re-entrant within one ntree process, so a caller can
-# hold it across "pick free ports" and "record them".
+# hold it across "pick free ports" and "record them". Picking ports without the
+# registry could hand out one another repo uses, so an unusable registry stops here.
 REG_LOCKED=0
 reg_lock() {
   (( REG_LOCKED )) && { REG_LOCKED=$((REG_LOCKED + 1)); return 0; }
-  mkdir -p "$(dirname "$PORT_REGISTRY")"
+  _check_state_dir
+  [[ -z "$REG_PROBLEM" ]] || die "$REG_PROBLEM"
   _acquire "$PORT_REGISTRY.lock" "port registry"
   REG_LOCKED=1
 }
@@ -311,6 +326,8 @@ port_in_registry() { [[ -f "$PORT_REGISTRY" ]] && grep -q "^$1 " "$PORT_REGISTRY
 # ports, just drops them. Args: <workspace_path> [port...]
 _registry_set() {
   local path="$1" p tmp; shift
+  # Cleanup (rm, rollback, doctor) carries on without the registry; doctor reports it.
+  _check_state_dir; [[ -z "$REG_PROBLEM" ]] || return 0
   reg_lock
   tmp="$(mktemp "$PORT_REGISTRY.XXXXXX")"
   {
@@ -323,6 +340,7 @@ _registry_set() {
 
 # Drop registry entries whose workspace folder no longer exists (any repo).
 _registry_prune() {
+  _check_state_dir; [[ -z "$REG_PROBLEM" ]] || return 0
   [[ -f "$PORT_REGISTRY" ]] || return 0
   reg_lock
   local line tmp; tmp="$(mktemp "$PORT_REGISTRY.XXXXXX")"
@@ -1105,6 +1123,9 @@ cmd_doctor() {
 
   [[ -d "$NTREE_DIR" ]] && _exclude_ntree_files
 
+  _check_state_dir
+  if [[ -n "$REG_PROBLEM" ]]; then warn "$REG_PROBLEM"; rc=1
+  else ok "port registry OK: $PORT_REGISTRY"; fi
   _registry_prune
 
 
