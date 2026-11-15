@@ -16,10 +16,10 @@ class Ntree < Formula
   desc "Parallel git worktree workspaces with ports and copy-on-write deps"
   homepage "https://github.com/c4d3j05/ntree"
   license "MIT"
-  version "0.2.0"
+  version "0.1.0"
 
   # Stable release tarball. Update url + sha256 on each tagged release.
-  url "https://github.com/c4d3j05/ntree/archive/refs/tags/v0.2.0.tar.gz"
+  url "https://github.com/c4d3j05/ntree/archive/refs/tags/v0.1.0.tar.gz"
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   head "https://github.com/c4d3j05/ntree.git", branch: "main"
