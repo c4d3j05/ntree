@@ -8,7 +8,7 @@ SHAREDIR ?= $(PREFIX)/share
 COMPDIR ?= $(SHAREDIR)/bash-completion/completions
 ZSHCOMPDIR ?= $(SHAREDIR)/zsh/site-functions
 
-.PHONY: install uninstall check test
+.PHONY: install uninstall check lint test
 install:
 	install -d $(DESTDIR)$(BINDIR) $(DESTDIR)$(COMPDIR) $(DESTDIR)$(ZSHCOMPDIR) $(DESTDIR)$(SHAREDIR)/ntree
 	install -m 755 bin/ntree $(DESTDIR)$(BINDIR)/ntree
@@ -22,6 +22,9 @@ uninstall:
 
 check:
 	bash -n bin/ntree && bash -n completions/ntree.bash
+
+lint:
+	shellcheck -S warning bin/ntree completions/ntree.bash test/smoke.sh
 
 test: check
 	test/smoke.sh
