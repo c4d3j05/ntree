@@ -143,9 +143,9 @@ state_update() {
 # ---------------------------------------------------------------------------
 pid_alive() { [[ -n "${1:-}" && "$1" != "null" ]] && kill -0 "$1" 2>/dev/null; }
 
-# A port is "taken" if any workspace reserves it (new .ports[] or legacy .port).
+# A port is "taken" if any workspace reserves it.
 port_in_state() {
-  state_get '.workspaces | to_entries[] | .value | (.ports // [.port]) | .[]' 2>/dev/null \
+  state_get '.workspaces[].ports[]' 2>/dev/null \
     | grep -qx "$1"
 }
 # Check both stacks: `localhost` may resolve to ::1 while a server binds IPv4-only.
@@ -203,8 +203,8 @@ alloc_ports() {
   die "not enough free ports (need $count) in range $NTREE_PORT_RANGE_START-$NTREE_PORT_RANGE_END"
 }
 
-# Echo a workspace's reserved ports, one per line (legacy .port aware).
-ws_ports() { state_get ".workspaces[\"$1\"] | (.ports // [.port]) | .[]"; }
+# Echo a workspace's reserved ports, one per line.
+ws_ports() { state_get ".workspaces[\"$1\"].ports[]"; }
 
 # How many ports to reserve: explicit override (--ports) > NTREE_PORTS length > NTREE_PORT_COUNT.
 # Args: [override]
@@ -231,6 +231,10 @@ _write_env() {
     (( i++ ))
   done
 }
+
+# A workspace always lives at .ntree/<name>; derived, never stored, so state
+# survives moving the repo.
+ws_path() { printf '%s\n' "$NTREE_DIR/$1"; }
 
 ws_exists() { state_get ".workspaces | has(\"$1\")" | grep -qx true; }
 require_ws() { ws_exists "$1" || die "no such workspace: $1"; }
@@ -399,11 +403,38 @@ warn_lockfile_drift() {
   done
 }
 
+# COW-clone NTREE_CLONE_DIRS from main into a workspace. Skips dirs the branch
+# tracks. refresh=1 replaces existing copies (sync-deps); refresh=0 keeps them.
+# Args: <path> <refresh>
+_clone_dirs() {
+  local path="$1" refresh="$2" d src cloned=0
+  local -a dirs; read -ra dirs <<< "$NTREE_CLONE_DIRS"
+  for d in ${dirs[@]+"${dirs[@]}"}; do
+    d="${d%/}"; src="$REPO_ROOT/$d"
+    [[ -e "$src" ]] || continue
+    git -C "$path" ls-files --error-unmatch -- "$d" >/dev/null 2>&1 && continue
+    # Python virtualenvs hardcode absolute paths — a cloned one is broken.
+    if [[ -f "$src/pyvenv.cfg" || -f "$src/bin/activate" ]]; then
+      warn "$d is a Python virtualenv (absolute paths) — not cloning; create it with NTREE_SETUP_CMD"
+      continue
+    fi
+    if [[ -e "$path/$d" ]]; then
+      (( refresh )) || continue
+      rm -rf "$path/$d"
+    fi
+    if cow_copy "$src" "$path/$d"; then ok "cloned $d (copy-on-write)"
+    else warn "copy-on-write clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
+    cloned=1
+  done
+  (( cloned )) && warn_lockfile_drift "$path"
+  return 0
+}
+
 # Provision a workspace: worktree + COW-cloned deps + port + registry entry.
 # Caller must hold the state lock. Args: <name> <branch> <base> [port_count_override]
 _provision_ws() {
   local name="$1" branch="$2" base="$3" port_override="${4:-}"
-  local path="$NTREE_DIR/$name" d src
+  local path; path="$(ws_path "$name")"
 
   # Fail on a bad NTREE_LINK_PATHS before creating anything.
   _validate_link_paths
@@ -416,25 +447,7 @@ _provision_ws() {
   fi
 
   # 2. Opt-in: COW-clone heavy untracked dirs from main (empty by default)
-  local cloned_any=0
-  for d in $NTREE_CLONE_DIRS; do
-    src="$REPO_ROOT/$d"
-    [[ -e "$src" ]] || continue
-    [[ -e "$path/$d" ]] && continue   # already present (e.g. git-tracked in the worktree)
-    # Python virtualenvs hardcode absolute paths — cloning yields a broken venv.
-    if [[ -f "$src/pyvenv.cfg" || -f "$src/bin/activate" ]]; then
-      warn "$d looks like a Python virtualenv — it hardcodes absolute paths and can't be safely cloned; skipping."
-      warn "  recreate it via NTREE_SETUP_CMD instead (e.g. 'python -m venv $d && $d/bin/pip install -r requirements.txt')"
-      continue
-    fi
-    if cow_copy "$src" "$path/$d"; then
-      ok "cloned $d (copy-on-write)"; cloned_any=1
-    else
-      warn "copy-on-write clone failed for $d; falling back to plain copy (uses disk)"
-      cp -R "$src" "$path/$d"; cloned_any=1
-    fi
-  done
-  (( cloned_any )) && warn_lockfile_drift "$path"
+  _clone_dirs "$path" 0
 
   # 2b. symlink NTREE_LINK_PATHS to main's live copies
   _link_ws "$path"
@@ -447,9 +460,9 @@ _provision_ws() {
   # keep ntree's own files out of `git status` / accidental commits
   _exclude_ntree_files
 
-  # 4. register (port = first, ports = full list)
-  state_update '.workspaces[$n] = {branch:$b, path:$p, ports:($ports|split(" ")|map(tonumber)), port:($ports|split(" ")|.[0]|tonumber), pid:null, created:$ts}' \
-    --arg n "$name" --arg b "$branch" --arg p "$path" \
+  # 4. register
+  state_update '.workspaces[$n] = {branch:$b, ports:($ports|split(" ")|map(tonumber)), pid:null, created:$ts}' \
+    --arg n "$name" --arg b "$branch" \
     --arg ports "$ports" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 
@@ -514,7 +527,7 @@ cmd_run() {
   unlock
 
   local path log
-  path="$(state_get ".workspaces[\"$name\"].path")"
+  path="$(ws_path "$name")"
   log="$path/ntree.log"
   (( created )) && _run_setup "$name" "$path"
 
@@ -534,7 +547,7 @@ cmd_run() {
     return 0
   fi
 
-  local port; port="$(state_get ".workspaces[\"$name\"].port")"
+  local port; port="$(state_get ".workspaces[\"$name\"].ports[0]")"
   (( created )) && info "created workspace $name (branch $branch)" \
                 || info "reusing workspace $name (branch $branch)"
   info "running (PORT=$port): $cmd_str"
@@ -565,11 +578,11 @@ _run_detached() {
     lock
     newports="$(alloc_ports "$cnt")"
     _write_env "$path" "$name" $newports
-    state_update '.workspaces[$n].ports = ($p|split(" ")|map(tonumber)) | .workspaces[$n].port = ($p|split(" ")|.[0]|tonumber)' \
+    state_update '.workspaces[$n].ports = ($p|split(" ")|map(tonumber))' \
       --arg n "$name" --arg p "$newports"
     unlock
   fi
-  local port; port="$(state_get ".workspaces[\"$name\"].port")"
+  local port; port="$(state_get ".workspaces[\"$name\"].ports[0]")"
 
   info "starting (detached): $cmd_str (PORT=$port) → $log"
   # Job control so the background job is its own process-group leader (macOS has
@@ -596,10 +609,10 @@ cmd_list() {
   while IFS= read -r n; do
     local branch port pid path status
     branch="$(state_get ".workspaces[\"$n\"].branch")"
-    port="$(state_get ".workspaces[\"$n\"].port")"
+    port="$(state_get ".workspaces[\"$n\"].ports[0]")"
     pid="$(state_get ".workspaces[\"$n\"].pid")"
-    path="$(state_get ".workspaces[\"$n\"].path")"
-    local pc; pc="$(state_get ".workspaces[\"$n\"] | (.ports // [.port]) | length")"
+    path="$(ws_path "$n")"
+    local pc; pc="$(state_get ".workspaces[\"$n\"].ports | length")"
     (( pc > 1 )) && port="$port+$((pc-1))"
     if pid_alive "$pid"; then status="${C_GRN}running${C_RST}"; else status="${C_DIM}stopped${C_RST}"; fi
     printf '%-20s %-24s %-6s %-9b %s\n' "$n" "$branch" "$port" "$status" "$path" >&2
@@ -610,7 +623,7 @@ cmd_stop() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree stop <name>"
   init_env; require_ws "$name"
   local pid path; pid="$(state_get ".workspaces[\"$name\"].pid")"
-  path="$(state_get ".workspaces[\"$name\"].path")"
+  path="$(ws_path "$name")"
   if pid_alive "$pid"; then
     kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     ok "stopped $name (pid $pid)"
@@ -626,7 +639,7 @@ cmd_stop() {
 cmd_open() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree open <name>"
   init_env; require_ws "$name"
-  local path; path="$(state_get ".workspaces[\"$name\"].path")"
+  local path; path="$(ws_path "$name")"
   if [[ -n "${EDITOR:-}" ]]; then "$EDITOR" "$path"
   elif command -v code >/dev/null 2>&1; then code "$path"
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$path"
@@ -637,7 +650,7 @@ cmd_open() {
 cmd_path() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree path <name>"
   require_ws "$name"
-  state_get ".workspaces[\"$name\"].path"
+  ws_path "$name"
 }
 
 # Print a shell function that adds `cd` support. Add to ~/.zshrc / ~/.bashrc:
@@ -682,7 +695,7 @@ cmd_git() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree git <name> <git-args...>"
   shift
   require_ws "$name"
-  local path; path="$(state_get ".workspaces[\"$name\"].path")"
+  local path; path="$(ws_path "$name")"
   git -C "$path" "$@"
 }
 
@@ -723,7 +736,7 @@ _sync() {
   local n
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue
-    local path; path="$(state_get ".workspaces[\"$n\"].path")"
+    local path; path="$(ws_path "$n")"
     [[ -d "$path" ]] || { warn "$n: worktree folder missing — skipping (run 'ntree doctor')"; continue; }
     info "syncing $n"
     (( links )) && _link_ws "$path"
@@ -735,18 +748,8 @@ _sync() {
 # Re-clone NTREE_CLONE_DIRS and re-run NTREE_SETUP_CMD in one workspace.
 # Args: <name> <path>
 _sync_deps_ws() {
-  local n="$1" path="$2" d src
-  for d in $NTREE_CLONE_DIRS; do
-    src="$REPO_ROOT/$d"
-    [[ -e "$src" ]] || continue
-    if [[ -f "$src/pyvenv.cfg" || -f "$src/bin/activate" ]]; then
-      warn "  $d is a virtualenv — skipping (use NTREE_SETUP_CMD to recreate it)"; continue
-    fi
-    rm -rf "$path/$d"
-    if cow_copy "$src" "$path/$d"; then ok "  re-cloned $d"
-    else warn "  copy-on-write clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
-  done
-  _run_setup "$n" "$path"
+  _clone_dirs "$2" 1
+  _run_setup "$1" "$2"
 }
 
 cmd_rm() {
@@ -765,7 +768,7 @@ cmd_rm() {
     read -r reply; [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted"; return; }
   fi
 
-  local path; path="$(state_get ".workspaces[\"$name\"].path")"
+  local path; path="$(ws_path "$name")"
   _remove_ws "$name" "$path"
   ok "removed workspace $name"
 }
@@ -811,18 +814,7 @@ cmd_doctor() {
     fi
   fi
 
-  # Repair info/exclude. Older ntree appended without a newline check, gluing
-  # '.env.workspace' onto the previous pattern (breaking both); split it back out.
-  if [[ -d "$NTREE_DIR" ]]; then
-    local excl; excl="$(_exclude_file)"
-    if [[ -f "$excl" ]] && grep -qE '.\.env\.workspace$' "$excl"; then
-      local tmp; tmp="$(mktemp)"
-      awk '/.\.env\.workspace$/ { print substr($0, 1, length($0) - 14); print ".env.workspace"; next } { print }' \
-        "$excl" > "$tmp" && mv "$tmp" "$excl"
-      ok "repaired a pattern glued to '.env.workspace' in $excl"
-    fi
-    _exclude_ntree_files
-  fi
+  [[ -d "$NTREE_DIR" ]] && _exclude_ntree_files
 
   # Let git drop bookkeeping for worktrees whose folders are gone.
   git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
@@ -834,7 +826,7 @@ cmd_doctor() {
   while IFS= read -r n; do
     [[ -z "$n" ]] && continue
     local path branch pid
-    path="$(state_get ".workspaces[\"$n\"].path")"
+    path="$(ws_path "$n")"
     branch="$(state_get ".workspaces[\"$n\"].branch")"
     pid="$(state_get ".workspaces[\"$n\"].pid")"
     if [[ ! -d "$path" ]]; then

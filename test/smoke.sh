@@ -48,12 +48,6 @@ check "shell-init cds into a workspace" bash -c "
   ntree_bin='$NTREE'; eval \"\$(\"\$ntree_bin\" shell-init | sed \"s|command ntree|\$ntree_bin|g\")\"
   cd '$R' && ntree feat-a && [ \"\$(pwd -P)\" = \"\$(cd '$R/.ntree/feat-a' && pwd -P)\" ]"
 
-# --- doctor repairs an exclude line glued by older versions -------------------
-printf 'UserInterfaceState.xcuserstate.env.workspace\n' >> "$R/.git/info/exclude"
-( cd "$R" && "$NTREE" doctor ) >/dev/null 2>&1 || true
-check "doctor splits the glued pattern" grep -qx 'UserInterfaceState.xcuserstate' "$R/.git/info/exclude"
-check "doctor leaves no glued line behind" fails grep -q '.\.env\.workspace$' "$R/.git/info/exclude"
-
 # --- rm ------------------------------------------------------------------------
 ( cd "$R" && "$NTREE" rm feat-a --force ) >/dev/null 2>&1
 check "rm removes the worktree" test ! -e "$R/.ntree/feat-a"
@@ -99,6 +93,19 @@ check "path escaping the repo is refused" fails bash -c "cd '$L' && '$NTREE' new
 set_links 'ctx'
 ( cd "$L" && "$NTREE" rm w1 --force ) >/dev/null 2>&1
 check "rm keeps the link source" test -f "$L/ctx/a.md"
+
+# --- clone dirs -------------------------------------------------------------------
+C="$TMP/clone"; new_repo "$C"
+mkdir -p "$C/deps" "$C/tdir"; echo v1 > "$C/deps/x"; echo t > "$C/tdir/f"
+git -C "$C" add tdir && git -C "$C" -c user.name=t -c user.email=t@t commit -q -m tdir
+echo '.ntreerc' >> "$C/.git/info/exclude"
+printf "NTREE_CLONE_DIRS='deps tdir'\n" > "$C/.ntreerc"; ( cd "$C" && "$NTREE" allow ) >/dev/null 2>&1
+( cd "$C" && "$NTREE" new c1 ) >/dev/null 2>&1
+check "clone dir copied into a new workspace" grep -qx v1 "$C/.ntree/c1/deps/x"
+echo v2 > "$C/deps/x"; echo local > "$C/.ntree/c1/tdir/f"
+( cd "$C" && "$NTREE" sync-deps c1 ) >/dev/null 2>&1
+check "sync-deps refreshes a clone dir" grep -qx v2 "$C/.ntree/c1/deps/x"
+check "sync-deps never replaces a dir the branch tracks" grep -qx local "$C/.ntree/c1/tdir/f"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
