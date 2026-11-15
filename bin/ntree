@@ -10,6 +10,10 @@ set -euo pipefail
 
 readonly NTREE_VERSION="0.1.0"
 
+# Every subcommand, in one place: shell-init and the completions derive from
+# this list, so a new command can't be forgotten in one of them.
+readonly NTREE_COMMANDS="new run list ls stop open git sync-deps allow path cd rm doctor shell-init version help"
+
 # ---------------------------------------------------------------------------
 # Output helpers
 # ---------------------------------------------------------------------------
@@ -72,8 +76,8 @@ init_env() {
   LOCK_DIR="$NTREE_DIR/.lock"
   RC_FILE="$REPO_ROOT/.ntreerc"
 
-  mkdir -p "$NTREE_DIR"
-  [[ -f "$STATE_FILE" ]] || echo '{"workspaces":{}}' > "$STATE_FILE"
+  # .ntree/ is created lazily by the first write (see lock), so read-only
+  # commands — and the shell function's `ntree path` probe — leave repos untouched.
 
   # .ntreerc is sourced as bash → only load it if the user has trusted it.
   if [[ -f "$RC_FILE" ]]; then
@@ -92,6 +96,8 @@ init_env() {
 # ---------------------------------------------------------------------------
 lock() {
   local tries=0 holder
+  mkdir -p "$NTREE_DIR"
+  [[ -f "$STATE_FILE" ]] || echo '{"workspaces":{}}' > "$STATE_FILE"
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     # Self-heal a stale lock left behind by a crashed process (kill -9).
     holder="$(cat "$LOCK_DIR/pid" 2>/dev/null || true)"
@@ -108,7 +114,10 @@ lock() {
 }
 unlock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; trap - EXIT; }
 
-state_get() { jq -r "$1" "$STATE_FILE"; }
+state_get() {
+  if [[ -f "$STATE_FILE" ]]; then jq -r "$1" "$STATE_FILE"
+  else jq -r "$1" <<< '{"workspaces":{}}'; fi
+}
 state_update() {
   # state_update '<jq filter>' [--arg name value ...]
   local filter="$1"; shift
@@ -213,6 +222,40 @@ _write_env() {
 ws_exists() { state_get ".workspaces | has(\"$1\")" | grep -qx true; }
 require_ws() { ws_exists "$1" || die "no such workspace: $1"; }
 
+# Branch names map to workspace names with '/' → '-', so 'a/b' and 'a-b' collide.
+# Refuse to reuse a workspace that belongs to a different branch.
+# Caller must hold the state lock. Args: <name> <branch>
+_check_ws_branch() {
+  local have; have="$(state_get ".workspaces[\"$1\"].branch")"
+  [[ "$have" == "$2" ]] && return 0
+  unlock
+  die "workspace name '$1' is already used by branch '$have' (branch '$2' maps to the same name)"
+}
+
+# Path of the repo's info/exclude. It lives in the common git dir, so one entry
+# covers the main checkout and every worktree.
+_exclude_file() {
+  local excl; excl="$(git -C "$REPO_ROOT" rev-parse --git-path info/exclude)"
+  [[ "$excl" = /* ]] || excl="$REPO_ROOT/$excl"
+  echo "$excl"
+}
+
+# Add ignore patterns to info/exclude, never gluing one onto an unterminated
+# last line. Args: <pattern...>
+_exclude_add() {
+  local excl p; excl="$(_exclude_file)"
+  mkdir -p "$(dirname "$excl")"
+  touch "$excl"
+  for p in "$@"; do
+    grep -qxF "$p" "$excl" && continue
+    [[ -s "$excl" && -n "$(tail -c1 "$excl")" ]] && printf '\n' >> "$excl"
+    printf '%s\n' "$p" >> "$excl"
+  done
+}
+
+# ntree's own files: the workspaces folder, per-workspace env and log.
+_exclude_ntree_files() { _exclude_add '/.ntree/' '.env.workspace' 'ntree.log'; }
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -233,7 +276,10 @@ cmd_new() {
   local path="$NTREE_DIR/$name"
 
   lock
-  ws_exists "$name" && { unlock; die "workspace already exists: $name"; }
+  if ws_exists "$name"; then
+    _check_ws_branch "$name" "$branch"
+    unlock; die "workspace already exists: $name"
+  fi
   _provision_ws "$name" "$branch" "$base" "$ports"
   local ports; ports="$(ws_ports "$name" | tr '\n' ' ')"
   unlock
@@ -296,10 +342,7 @@ _provision_ws() {
   _write_env "$path" "$name" $ports
 
   # keep ntree's own files out of `git status` / accidental commits
-  local excl; excl="$(git -C "$path" rev-parse --git-path info/exclude 2>/dev/null || true)"
-  if [[ -n "$excl" && -f "$excl" ]] && ! grep -qxF '.env.workspace' "$excl" 2>/dev/null; then
-    printf '.env.workspace\nntree.log\n' >> "$excl"
-  fi
+  _exclude_ntree_files
 
   # 4. register (port = first, ports = full list)
   state_update '.workspaces[$n] = {branch:$b, path:$p, ports:($ports|split(" ")|map(tonumber)), port:($ports|split(" ")|.[0]|tonumber), pid:null, created:$ts}' \
@@ -360,7 +403,9 @@ cmd_run() {
 
   local name="${branch//\//-}" created=0
   lock
-  if ! ws_exists "$name"; then
+  if ws_exists "$name"; then
+    _check_ws_branch "$name" "$branch"
+  else
     _provision_ws "$name" "$branch" "$base" "$ports"; created=1
   fi
   unlock
@@ -495,22 +540,36 @@ cmd_path() {
 #   eval "$(ntree shell-init)"
 # Then `ntree <workspace>` (or `ntree cd <workspace>`) changes directory.
 cmd_shell_init() {
-  cat <<'SH'
+  local cmds; cmds="$(printf '%s|' $NTREE_COMMANDS __complete --version -v --help -h)"
+  cat <<SH
 ntree() {
-  if [ "$1" = "cd" ]; then
-    local __d; __d="$(command ntree path "${2:-}")" || return
-    cd "$__d"
+  if [ "\$1" = "cd" ]; then
+    local __d; __d="\$(command ntree path "\${2:-}")" || return
+    cd "\$__d"
     return
   fi
-  case "${1:-}" in
-    ""|new|run|list|ls|stop|open|git|sync-deps|allow|rm|doctor|path|shell-init|version|--version|-v|help|--help|-h)
-      command ntree "$@" ;;
+  case "\${1:-}" in
+    ""|${cmds%|})
+      command ntree "\$@" ;;
     *)
       local __d
-      if __d="$(command ntree path "$1" 2>/dev/null)"; then cd "$__d"; else command ntree "$@"; fi ;;
+      if __d="\$(command ntree path "\$1" 2>/dev/null)"; then cd "\$__d"; else command ntree "\$@"; fi ;;
   esac
 }
 SH
+}
+
+# Hidden helper for the shell completions, so they share the command list and
+# find workspaces from inside a worktree too. Never creates .ntree/.
+# Args: commands | workspaces
+cmd_complete() {
+  case "${1:-}" in
+    commands) printf '%s\n' $NTREE_COMMANDS ;;
+    workspaces)
+      local root; root="$(repo_root 2>/dev/null)" || return 0
+      [[ -f "$root/.ntree/state.json" ]] || return 0
+      jq -r '.workspaces | keys[]' "$root/.ntree/state.json" 2>/dev/null || true ;;
+  esac
 }
 
 # Run any git command in a workspace's worktree. Everything after <name>
@@ -617,6 +676,19 @@ cmd_doctor() {
     fi
   fi
 
+  # Repair info/exclude. Older ntree appended without a newline check, gluing
+  # '.env.workspace' onto the previous pattern (breaking both); split it back out.
+  if [[ -d "$NTREE_DIR" ]]; then
+    local excl; excl="$(_exclude_file)"
+    if [[ -f "$excl" ]] && grep -qE '.\.env\.workspace$' "$excl"; then
+      local tmp; tmp="$(mktemp)"
+      awk '/.\.env\.workspace$/ { print substr($0, 1, length($0) - 14); print ".env.workspace"; next } { print }' \
+        "$excl" > "$tmp" && mv "$tmp" "$excl"
+      ok "repaired a pattern glued to '.env.workspace' in $excl"
+    fi
+    _exclude_ntree_files
+  fi
+
   # Let git drop bookkeeping for worktrees whose folders are gone.
   git -C "$REPO_ROOT" worktree prune 2>/dev/null || true
 
@@ -683,7 +755,8 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
   allow                          trust this repo's .ntreerc so it gets loaded
   path <name>                    print a workspace's absolute path
   cd <name>                      cd into a workspace (needs shell integration)
-  doctor                         verify APFS, reconcile state, prune stale entries
+  doctor                         verify APFS, reconcile state, prune stale entries,
+                                 repair ntree's git-ignore entries
   version                        print version
   help                           this message
 
@@ -708,6 +781,7 @@ main() {
     rm)      cmd_rm "$@" ;;
     path)    init_env; cmd_path "$@" ;;
     shell-init) cmd_shell_init ;;
+    __complete) cmd_complete "$@" ;;
     cd)      die "'ntree cd' needs shell integration — add to ~/.zshrc: eval \"\$(ntree shell-init)\"" ;;
     doctor)  cmd_doctor "$@" ;;
     version|--version|-v) echo "ntree $NTREE_VERSION" ;;
