@@ -99,9 +99,10 @@ ntree rm feature-login           # tear it down (prompts unless --force)
 | `ntree open <name>` | Open the folder in `$EDITOR` / VS Code / Finder. |
 | `ntree <name>` / `ntree cd <name>` | `cd` into the workspace (needs [shell integration](#shell-integration-optional-for-cd)). `ntree path <name>` prints its path. |
 | `ntree git <name> <args...>` | Run any git command in that workspace's worktree (e.g. `ntree git feature-a status`, `ntree git feature-a push -u origin feature-a`). Exits with git's code. |
+| `ntree sync [<name>]` | Bring a workspace (or all) up to date with `.ntreerc`: create/repair the [linked paths](#shared-untracked-files-linked-paths), then refresh deps like `sync-deps`. Use after editing `.ntreerc`. |
 | `ntree sync-deps [<name>]` | Refresh a workspace's deps (or all): re-run `NTREE_SETUP_CMD` and re-clone any `NTREE_CLONE_DIRS`. Use after a lockfile change in `main`. |
 | `ntree rm <name> [--force]` | Stop, kill any server still running in the worktree (same scoped kill as `stop`), remove the worktree, delete the folder. |
-| `ntree doctor` | Verify APFS/git, clear stale locks, prune workspaces whose worktree vanished, flag deleted branches and orphan folders, reconcile PIDs, and make sure `.ntree/`, `.env.workspace` and `ntree.log` are git-ignored (repairing a broken entry left by older versions). |
+| `ntree doctor` | Verify APFS/git, clear stale locks, prune workspaces whose worktree vanished, flag deleted branches and orphan folders, reconcile PIDs, flag missing/broken linked paths, and make sure `.ntree/`, `.env.workspace` and `ntree.log` are git-ignored (repairing a broken entry left by older versions). |
 | `ntree allow` | Trust this repo's `.ntreerc` so it gets loaded (re-run after edits). |
 | `ntree version` | Print the version. |
 
@@ -125,6 +126,7 @@ NTREE_PORT_COUNT=1                   # ports reserved per workspace
 # NTREE_PORTS='API FRONTEND'         # optional: name the ports → API_PORT, FRONTEND_PORT
 #                                    #   (its length sets the count; PORT/PORT2 still work)
 # NTREE_CLONE_DIRS='node_modules'    # opt-in: COW-clone deps from main instead of setup
+# NTREE_LINK_PATHS='notes .env'      # untracked paths shared live via symlink to main
 ```
 
 **Deps: setup vs. clone.** By default `new` only makes the worktree. Set
@@ -191,6 +193,44 @@ workspaces don't collide.
 
 > After a lockfile change in `main`, refresh a workspace with
 > `ntree sync-deps <name>` (re-runs setup / re-clones).
+
+### Shared untracked files (linked paths)
+
+Tracked files reach every workspace through git. For files that are **not**
+tracked but should be identical everywhere — local notes, agent context, a
+gitignored `.env`, editor or agent settings — list them in `NTREE_LINK_PATHS`:
+
+```bash
+NTREE_LINK_PATHS='notes .claude/settings.local.json backend/.env'
+```
+
+Each workspace then gets a relative symlink to the copy in the main checkout, so
+an edit made from any workspace is instantly visible in all of them. Files and
+directories both work. ntree:
+
+- links them on `new`; run `ntree sync` to add them to existing workspaces or
+  after editing the list;
+- git-ignores each one as `/<path>` in `.git/info/exclude` (a symlink is a file
+  to git, so a `dir/` pattern would not match it);
+- refuses paths that are tracked by git, absolute, contain `..`, or are also in
+  `NTREE_CLONE_DIRS`; skips a workspace whose branch tracks that path;
+- never deletes the source: `ntree rm` removes only the link.
+
+Things to know before relying on it:
+
+- **The main checkout holds the only copy.** It isn't in git, so it has no
+  history and no backup; deleting or re-cloning main breaks every link.
+- **No per-branch versions.** Something that should change with the code
+  belongs in git, not here.
+- **No locking.** Two workspaces writing the same file at once means the last
+  write wins. Prefer per-workspace files for scratch output, e.g.
+  `notes/$NTREE_WORKSPACE.md`.
+- **Search tools may skip linked paths.** They're gitignored symlinks, so tools
+  that honor `.gitignore` or don't follow symlinks (ripgrep by default, and
+  agents built on it) won't find them in a search. Opening them by path works;
+  point agents at them explicitly, e.g. from `CLAUDE.md` / `AGENTS.md`.
+- **Build tools that scan folders** (e.g. Xcode's synchronized groups) will see
+  linked files like any other; keep links out of source folders.
 
 ## How it works
 
