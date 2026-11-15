@@ -177,7 +177,9 @@ _release_all() {
 }
 
 lock() {
-  mkdir -p "$NTREE_DIR"
+  # Ignore .ntree/ the moment it exists, so a `new` that fails before building
+  # anything doesn't leave it showing up in git status.
+  if [[ ! -d "$NTREE_DIR" ]]; then mkdir -p "$NTREE_DIR"; _exclude_ntree_files; fi
   [[ -f "$STATE_FILE" ]] || echo '{"workspaces":{}}' > "$STATE_FILE"
   _acquire "$LOCK_DIR" state
 }
