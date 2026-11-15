@@ -29,7 +29,7 @@ NTREE_PORT_COUNT=1
 
 # OPTIONAL friendly port names. When set, its length is the port count (so you
 # don't also need NTREE_PORT_COUNT) and each port gets a <NAME>_PORT alias
-# alongside PORT/PORT2. Great for a typical backend + frontend split:
+# alongside PORT/PORT2, e.g. for a backend + frontend:
 #   NTREE_PORTS='API FRONTEND'   → API_PORT + FRONTEND_PORT (and PORT + PORT2)
 # Then in a dev command: 'API_PORT=$API_PORT vite --port $FRONTEND_PORT' (single
 # quotes so it expands at run time). PORT still equals the first port.
@@ -37,7 +37,7 @@ NTREE_PORT_COUNT=1
 
 # OPT-IN speed hack (leave empty to use NTREE_SETUP_CMD, which is correct):
 # COW-clone these untracked dirs from main into each new workspace instead of
-# installing. Instant + ~0 disk, but a SNAPSHOT that can be stale — only suits a
+# installing. Fast and shares disk blocks, but a SNAPSHOT that can be stale — only suits a
 # big npm/yarn node_modules. Never list .venv (absolute paths) or a pnpm/Bun
 # node_modules (already globally deduped).
 # NTREE_CLONE_DIRS='node_modules'
@@ -45,5 +45,6 @@ NTREE_PORT_COUNT=1
 # Untracked files/dirs every workspace should share LIVE (not a snapshot): each
 # workspace gets a symlink to the copy in the main checkout, git-ignored as
 # '/<path>'. For notes, agent context, a gitignored .env, local settings. Tracked
-# paths are refused (git already shares those). Run `ntree sync` after editing.
+# paths are refused (git already shares those). Run `ntree sync` after editing;
+# it also removes links you drop from the list.
 # NTREE_LINK_PATHS='notes .claude/settings.local.json'

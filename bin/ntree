@@ -3,12 +3,12 @@
 # ntree — run multiple branches of one repo in parallel workspaces,
 #         without duplicating file content on disk.
 #
-# Stack: git worktree + APFS copy-on-write clones + bash.
+# Stack: git worktree + copy-on-write clones (APFS / reflink) + bash.
 # See: https://github.com/c4d3j05/ntree
 #
 set -euo pipefail
 
-readonly NTREE_VERSION="0.1.0"
+readonly NTREE_VERSION="0.2.0"
 
 # Every subcommand, in one place: shell-init and the completions derive from
 # this list, so a new command can't be forgotten in one of them.
@@ -652,8 +652,8 @@ _run_detached() {
   local port; port="$(state_get ".workspaces[\"$name\"].ports[0]")"
 
   info "starting (detached): $cmd_str (PORT=$port) → $log"
-  # Job control so the background job is its own process-group leader (macOS has
-  # no setsid; Linux works the same way); then $newpid is a real pgid and `stop` can kill the whole tree.
+  # Job control makes the background job its own process-group leader (portable,
+  # unlike setsid, which macOS lacks), so `stop` can kill the whole tree via $newpid.
   set -m
   ( cd "$path" && set -a && . ./.env.workspace && set +a && exec bash -c "$cmd_str" ) >"$log" 2>&1 &
   local newpid=$!
@@ -945,7 +945,7 @@ cmd_doctor() {
 
 usage() {
   cat >&2 <<EOF
-${C_BLD}ntree${C_RST} — parallel git worktree workspaces with APFS copy-on-write (v$NTREE_VERSION)
+${C_BLD}ntree${C_RST} — parallel git worktree workspaces (v$NTREE_VERSION)
 
 ${C_BLD}usage:${C_RST} ntree <command> [args]
 
@@ -963,7 +963,7 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
   list                           show the root checkout + workspaces, branches, ports, status
   stop <name>                    stop the process and free the workspace's ports
                                  (also kills untracked servers running in its worktree)
-  open <name>                    open folder in \$EDITOR / VS Code
+  open <name>                    open folder in \$EDITOR / VS Code / file manager
   git <name> <args...>           run any git command in the workspace's worktree
   sync [<name>]                  create/repair linked paths, remove unlisted ones
                                  (all workspaces if omitted)
@@ -973,8 +973,8 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
   allow                          trust this repo's .ntreerc so it gets loaded
   path <name>                    print a workspace's absolute path
   cd <name>                      cd into a workspace (needs shell integration)
-  doctor                         verify APFS, reconcile state, prune stale entries,
-                                 repair ntree's git-ignore entries
+  doctor                         check setup, repair moved worktrees, reconcile
+                                 state and ports, flag link problems
   version                        print version
   help                           this message
 

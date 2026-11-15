@@ -9,13 +9,13 @@ duplicated), plus a small orchestrator for ports, per-workspace env, and process
 lifecycle (`run -d` / `stop` / `list`). Every workspace is a plain folder, so
 editors, LSPs, file watchers, and dev servers all work unmodified.
 
-Dependencies are installed **correctly per branch** by your own package manager
-via an optional setup command (`npm ci`, `uv sync`, …). For a big npm/yarn
-`node_modules`, you can opt into instant **APFS copy-on-write** cloning instead.
+Dependencies are installed per branch by your own package manager via an
+optional setup command (`npm ci`, `uv sync`, …). For a big npm/yarn
+`node_modules`, you can copy-on-write clone it from the main checkout instead.
 
-Works on macOS and Linux. Optional dep cloning uses APFS copy-on-write on macOS and
-reflinks on Linux (btrfs/XFS/bcachefs); elsewhere it falls back to a plain copy.
-Requires `bash`, `git`, `jq`, `lsof`, and `nc` (netcat).
+Works on macOS and Linux. Cloning uses APFS clones on macOS and reflinks on Linux
+(btrfs/XFS/bcachefs); elsewhere it falls back to a plain copy. Requires `bash`,
+`git`, `jq`, `lsof`, and `nc` (netcat).
 
 ## Install
 
@@ -24,9 +24,11 @@ Requires `bash`, `git`, `jq`, `lsof`, and `nc` (netcat).
 brew tap c4d3j05/ntree https://github.com/c4d3j05/ntree
 brew install ntree
 
-# Or bleeding edge, no release required:
+# Or the latest main, no release required:
 brew install --HEAD c4d3j05/ntree/ntree
 ```
+
+Homebrew installs the dependencies (`git`, `jq`) for you.
 
 ### Linux / manual install
 
@@ -37,10 +39,9 @@ git clone https://github.com/c4d3j05/ntree && cd ntree
 sudo make install                   # or: make install PREFIX=$HOME/.local
 ```
 
-This installs the binary, bash completion, and `share/ntree/.ntreerc.example`
-(copy it into your repo as `.ntreerc`). Remove with `make uninstall`.
-
-Dependencies (`git`, `jq`) are installed automatically by Homebrew.
+This installs the binary, bash and zsh completions, and
+`share/ntree/.ntreerc.example` (copy it into your repo as `.ntreerc`). Remove
+with `make uninstall`.
 
 ### Shell integration (optional, for `cd`)
 
@@ -70,8 +71,6 @@ cd your-repo
 cp "$(brew --prefix 2>/dev/null || echo /usr/local)/share/ntree/.ntreerc.example" .ntreerc
 $EDITOR .ntreerc && ntree allow   # .ntreerc is sourced as bash → trust it once
 
-echo ".ntree/" >> .gitignore        # workspaces live here; don't commit them
-
 ntree new feature-login                     # worktree + ports (+ runs setup if configured)
 
 # Run a dev server in the background (detached, tracked by pid):
@@ -79,13 +78,13 @@ ntree run feature-login -d -- npm run dev   # remembers the command
 ntree run feature-login -d                  # later: reuses the remembered command
 ntree stop feature-login
 
-# Or run a one-off command in the foreground (streams output, returns exit code):
-ntree run feature-login --rm -- npm test    # create, run tests, tear down
+# Or run a one-off command in the foreground (in your terminal, returns its exit code):
+ntree run tmp-tests --rm -- npm test        # create, run tests, tear down
 ntree run hotfix -- npm run build           # keep the workspace to inspect after
 ntree list                       # see branches, ports, running status
 ntree open feature-login         # open the folder in your editor
 ntree stop feature-login
-ntree rm feature-login           # tear it down (prompts unless --force)
+ntree rm feature-login           # tear it down (refuses uncommitted changes unless --force)
 ```
 
 ## Commands
@@ -93,16 +92,16 @@ ntree rm feature-login           # tear it down (prompts unless --force)
 | Command | Description |
 |---|---|
 | `ntree new <branch> [--from <base>] [--ports <n>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist. `--ports` overrides how many ports to reserve for this workspace. |
-| `ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): streams + logs output, exits with the command's code; `--rm` tears the workspace down afterward. **`-d`/`--detach`**: runs in the background tracked by pid, for dev servers. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. Logs to `.ntree/<name>/ntree.log`. |
+| `ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. |
 | `ntree list` | Show the root checkout plus all workspaces, branches, ports, and live status. |
 | `ntree stop <name>` | Stop the detached (`run -d`) process **and reclaim the workspace's ports** — also kills any server still listening from inside the worktree, on *any* port (e.g. a `npm run dev` you launched by hand, or a dev server that auto-picked its own port). Only TCP listeners are targeted, so a shell you `cd`'d in is spared, as is any listener whose working dir is outside the worktree. |
 | `ntree open <name>` | Open the folder in `$EDITOR` / VS Code / Finder. |
 | `ntree <name>` / `ntree cd <name>` | `cd` into the workspace (needs [shell integration](#shell-integration-optional-for-cd)). `ntree path <name>` prints its path. |
 | `ntree git <name> <args...>` | Run any git command in that workspace's worktree (e.g. `ntree git feature-a status`, `ntree git feature-a push -u origin feature-a`). Exits with git's code. |
-| `ntree sync [<name>]` | Bring a workspace (or all) up to date with `.ntreerc`: create/repair the [linked paths](#shared-untracked-files-linked-paths), then refresh deps like `sync-deps`. Use after editing `.ntreerc`. |
+| `ntree sync [<name>]` | Create or repair the [linked paths](#shared-untracked-files-linked-paths) in a workspace (or all), and remove links no longer listed. Run after editing `NTREE_LINK_PATHS`. |
 | `ntree sync-deps [<name>]` | Refresh a workspace's deps (or all): re-run `NTREE_SETUP_CMD` and re-clone any `NTREE_CLONE_DIRS`. Use after a lockfile change in `main`. |
-| `ntree rm <name> [--force]` | Stop, kill any server still running in the worktree (same scoped kill as `stop`), remove the worktree, delete the folder. |
-| `ntree doctor` | Verify APFS/git, clear stale locks, prune workspaces whose worktree vanished, flag deleted branches and orphan folders, reconcile PIDs, flag missing/broken linked paths, and make sure `.ntree/`, `.env.workspace` and `ntree.log` are git-ignored (repairing a broken entry left by older versions). |
+| `ntree rm <name> [--force]` | Stop, kill any server still running in the worktree (same scoped kill as `stop`), remove the worktree, delete the folder. Refuses if the worktree has uncommitted changes; `--force` discards them. The branch is kept. |
+| `ntree doctor` | Check dependencies and filesystem, clear stale locks, reconnect worktrees after the repo was moved, prune workspaces whose folder vanished, flag deleted branches, orphan folders and missing/broken/stale linked paths, reconcile PIDs and the port registry, and make sure `.ntree/`, `.env.workspace` and `ntree.log` are git-ignored. |
 | `ntree allow` | Trust this repo's `.ntreerc` so it gets loaded (re-run after edits). |
 | `ntree version` | Print the version. |
 
@@ -111,9 +110,8 @@ Branch names with `/` map to a workspace name with `-` (e.g. `feat/login` →
 
 ## Configuration
 
-`.ntreerc` is **entirely optional** — ntree works with zero config: `ntree run`
-takes any command, and `ntree run <name> [-d] -- <cmd>` remembers its command per
-workspace. Use `.ntreerc` only to set project-wide defaults. Because it is
+`.ntreerc` is optional: `ntree run` takes any command and remembers it per
+workspace. Use `.ntreerc` for project-wide defaults. Because it is
 **sourced as bash**, ntree won't load it until you trust it with `ntree allow`
 (re-run after edits). See [`.ntreerc.example`](.ntreerc.example):
 
@@ -133,14 +131,16 @@ NTREE_PORT_COUNT=1                   # ports reserved per workspace
 `NTREE_SETUP_CMD` (e.g. `npm ci`, `pnpm i`, `uv sync`, `bundle install`) and
 ntree runs it in each new workspace — your package manager installs exactly what
 the branch's lockfile specifies. `NTREE_CLONE_DIRS` is an **opt-in** speed hack:
-it COW-clones those dirs from `main` (instant, ~0 disk) but is a *snapshot* that
-can be stale, so it only suits a big npm/yarn `node_modules`. Don't clone `.venv`
+it copy-on-write clones those dirs from the main checkout (fast, shares disk
+blocks) but is a *snapshot* that can be stale, so it only suits a big npm/yarn
+`node_modules`. Dirs the branch tracks are never replaced. Don't clone `.venv`
 (absolute paths) or a pnpm/Bun `node_modules` (already globally deduped) — use
 `NTREE_SETUP_CMD` for those.
 
-> Quote `$PORT` with **single** quotes in `.ntreerc` or on the `run`
-> command line (`'... --port $PORT'`) so it expands at run time, not when the
-> config is read.
+> To use `$PORT` in a command, pass the whole command as **one single-quoted**
+> argument (`ntree run web -- 'npm run dev -- --port $PORT'`) so it expands at
+> run time inside the workspace. Use single quotes in `.ntreerc` too, so it
+> isn't expanded when the config is read.
 
 ### Works with any stack
 
@@ -170,8 +170,9 @@ hardcode absolute paths and can't be copied).
   a central cache keyed by path — each workspace still gets its own, but `ntree rm`
   won't clean it up. Run tools with `poetry run …`.
 
-Working on a node repo and a python repo at once just means running ntree in
-each — every repo has its own `.ntree/` state and (optional) `.ntreerc`. Stateful
+Working on a node repo and a python repo at once means running ntree in each:
+every repo has its own `.ntree/` state and (optional) `.ntreerc`. Ports are
+reserved machine-wide, so two repos never get the same one. Stateful
 apps (Django/Rails) should namespace their DB with `$NTREE_WORKSPACE` so parallel
 workspaces don't collide.
 
@@ -204,12 +205,12 @@ gitignored `.env`, editor or agent settings — list them in `NTREE_LINK_PATHS`:
 NTREE_LINK_PATHS='notes .claude/settings.local.json backend/.env'
 ```
 
-Each workspace then gets a relative symlink to the copy in the main checkout, so
-an edit made from any workspace is instantly visible in all of them. Files and
+Each workspace then gets a symlink to the copy in the main checkout, so an edit
+made from any workspace shows up in all of them. Files and
 directories both work. ntree:
 
-- links them on `new`; run `ntree sync` to add them to existing workspaces or
-  after editing the list;
+- links them on `new`; run `ntree sync` after editing the list to add new links
+  to existing workspaces and remove the ones you dropped;
 - git-ignores each one as `/<path>` in `.git/info/exclude` (a symlink is a file
   to git, so a `dir/` pattern would not match it);
 - refuses paths that are tracked by git, absolute, contain `..`, or are also in
@@ -237,7 +238,7 @@ Things to know before relying on it:
 ```
 repo/               # your main checkout
 .ntree/
-  state.json        # workspace registry (name, branch, path, ports, pid, cmd)
+  state.json        # workspace registry (name, branch, ports, pid, cmd, links)
   feature-login/    # a git worktree — its own working dir, shared .git
   feature-billing/  # another one, on a different branch and port
 ```
@@ -245,8 +246,10 @@ repo/               # your main checkout
 - **git worktree** gives each branch a real working directory that shares the
   one `.git` object store — history and blobs are never duplicated.
 - **deps** are installed per workspace by `NTREE_SETUP_CMD` (correct for the
-  branch), or optionally **APFS copy-on-write** cloned from `main` (instant, and
-  unchanged files share disk blocks) when `NTREE_CLONE_DIRS` is set.
+  branch), or copy-on-write cloned from the main checkout when
+  `NTREE_CLONE_DIRS` is set (unchanged files share disk blocks).
+- **ports** are reserved in `~/.local/state/ntree/ports` (or
+  `$XDG_STATE_HOME/ntree/ports`), shared by every repo on the machine.
 
 ### Disk cost per extra workspace
 
@@ -260,8 +263,7 @@ repo/               # your main checkout
 ## Development
 
 ```bash
-bash -n bin/ntree     # syntax check
-test/smoke.sh         # end-to-end checks against throwaway repos
+make test             # syntax check + end-to-end checks against throwaway repos
 ./bin/ntree doctor    # environment check
 
 # run your working copy instead of the Homebrew build
