@@ -466,7 +466,11 @@ _clone_dirs() {
       rm -rf "$path/$d"
     fi
     if cow_copy "$src" "$path/$d"; then ok "cloned $d (copy-on-write)"
-    else warn "copy-on-write clone failed for $d; plain copy (uses disk)"; cp -R "$src" "$path/$d"; fi
+    else
+      # A failed clone can leave a partial copy; clear it or cp -R nests inside it.
+      warn "copy-on-write clone failed for $d; plain copy (uses disk)"
+      rm -rf "$path/$d"; cp -R "$src" "$path/$d"
+    fi
     cloned=1
   done
   (( cloned )) && warn_lockfile_drift "$path"
