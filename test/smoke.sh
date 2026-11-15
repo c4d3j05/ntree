@@ -350,5 +350,10 @@ check "list truncates a long description" bash -c "cd '$E' && '$NTREE' list | gr
 check "the full text is kept" bash -c "cd '$E' && test \"\$('$NTREE' desc sp | tr -d '\n' | wc -c | tr -d ' ')\" = 80"
 check "desc on an unknown workspace fails" fails bash -c "cd '$E' && '$NTREE' desc nope hi"
 
+# --- a new that fails before building still leaves .ntree/ ignored ----------------
+F="$TMP/failearly"; new_repo "$F"
+( cd "$F" && "$NTREE" new "$(git -C "$F" branch --show-current)" ) >/dev/null 2>&1 || true
+check "a new that fails early leaves git status clean" test -z "$(git -C "$F" status --porcelain)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
