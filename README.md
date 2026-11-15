@@ -55,6 +55,12 @@ echo 'eval "$(ntree shell-init)"' >> ~/.zshrc   # or ~/.bashrc
 Then `ntree feature-login` (or `ntree cd feature-login`) drops you into that
 workspace. Everything else passes straight through to ntree.
 
+It also loads a workspace's environment while you're in it: `cd` into a
+workspace (or open a shell there, e.g. an editor's terminal) and `PORT`,
+`NTREE_WORKSPACE` and the other `.env.workspace` values are exported, so a
+server you start by hand binds the workspace's port; leaving unsets them. In a
+shell without it, `eval "$(ntree env)"` does the same once.
+
 ### Completions
 
 Homebrew installs bash and zsh completions (commands, workspace names, branches
@@ -92,8 +98,9 @@ ntree rm feature-login           # tear it down (refuses uncommitted changes unl
 | Command | Description |
 |---|---|
 | `ntree new <branch> [--from <base>] [--ports <n>] [-m <description>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist, starting from the repo's default branch (`origin/HEAD`, else `main`/`master`) unless `--from` says otherwise. Refuses a branch that's already checked out elsewhere and says where. `--ports` overrides how many ports to reserve for this workspace. |
-| `ntree run <branch> [--from <base>] [-m <description>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it, and also when you Ctrl-C it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. |
-| `ntree list` | Show the root checkout plus all workspaces, the branch each has checked out right now, ports, live status and description. Prints to stdout, so it can be piped. |
+| `ntree run <branch\|name> [--from <base>] [-m <description>] [-d] [--rm] [--forget] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). Takes the branch or the workspace name `list` shows (`feat-x` for `feat/x`). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it, and also when you Ctrl-C it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers; if the command exits right away, `run -d` fails and shows the end of its log. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it; `--forget` clears it. |
+| `ntree list [--json]` | Show the root checkout plus all workspaces, the branch each has checked out right now, ports, status and description. Status is `running` (a `run -d` process), `listening` (something else serves on the workspace's port, e.g. a server started by hand) or `stopped`. Prints to stdout; `--json` is the stable form for tools (name, branch, created_branch, ports, port, status, pid, desc, path, cmd). |
+| `ntree env [<name>]` | Print `export` lines for a workspace's `.env.workspace` (the one you're in by default). Shell integration loads them automatically when you `cd` in. |
 | `ntree desc <name> [<text> \| --clear]` | Show, set or clear a workspace's short description — what's going on in it (e.g. `ntree desc fix-crash "repro on iOS 26 only"`). `new`/`run` take `-m "<text>"` to set it up front. Kept in `.ntree/state.json`, so it belongs to the workspace, not the branch. |
 | `ntree stop <name>` | Stop the detached (`run -d`) process **and reclaim the workspace's ports** — also kills any server still listening from inside the worktree, on *any* port (e.g. a `npm run dev` you launched by hand, or a dev server that auto-picked its own port). Only TCP listeners are targeted, so a shell you `cd`'d in is spared, as is any listener whose working dir is outside the worktree. A server that forks itself into the background shows as `stopped` in `list` (the process ntree started has exited), but `stop` still finds and kills it. |
 | `ntree open <name>` | Open the folder in `$EDITOR` / VS Code / Finder. |
@@ -102,6 +109,7 @@ ntree rm feature-login           # tear it down (refuses uncommitted changes unl
 | `ntree sync [<name>]` | Create or repair the [linked paths](#shared-untracked-files-linked-paths) in a workspace (or all), and remove links no longer listed. Run after editing `NTREE_LINK_PATHS`. Refuses to run until an edited `.ntreerc` is trusted again with `ntree allow`. |
 | `ntree sync-deps [<name>]` | Refresh a workspace's deps (or all): re-run `NTREE_SETUP_CMD` and re-clone any `NTREE_CLONE_DIRS`. Use after a lockfile change in `main`. |
 | `ntree rm <name> [--force]` | Stop, kill any server still running in the worktree (same scoped kill as `stop`), remove the worktree, delete the folder. Refuses if the worktree has uncommitted changes; `--force` discards them. The branch is kept. |
+| `ntree clean [--yes]` | Remove the workspaces whose work is already merged into the default branch — by merge, rebase or squash merge (GitHub's "Squash and merge"), checked against the local branch and `origin` — together with their branches. Only workspaces with commits of their own, no uncommitted changes and nothing running; asks first unless `--yes`. `doctor` says when there's something to clean. |
 | `ntree doctor` | Check dependencies and filesystem, clear stale locks, reconnect worktrees after the repo was moved, prune workspaces whose folder vanished, flag deleted branches, orphan folders and missing/broken/stale linked paths, reconcile PIDs and the port registry, and make sure `.ntree/`, `.env.workspace` and `ntree.log` are git-ignored. If `state.json` is unreadable (every other command refuses to run), it keeps a copy and rebuilds the state from the workspaces on disk. |
 | `ntree allow` | Trust this repo's `.ntreerc` so it gets loaded (re-run after edits). |
 | `ntree version` | Print the version. |

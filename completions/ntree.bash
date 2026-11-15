@@ -14,7 +14,7 @@ _ntree() {
   fi
 
   case "${COMP_WORDS[1]}" in
-    stop|open|git|desc|sync|sync-deps|path|cd|rm)
+    stop|open|git|desc|env|sync|sync-deps|path|cd|rm)
       [[ $COMP_CWORD -eq 2 ]] && COMPREPLY=( $(compgen -W "$(command ntree __complete workspaces)" -- "$cur") )
       ;;
     new)
@@ -23,8 +23,10 @@ _ntree() {
       ;;
     run)
       [[ "$prev" == "--from" ]] && COMPREPLY=( $(compgen -W "$(git branch --format='%(refname:short)' 2>/dev/null)" -- "$cur") )
-      [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--from --ports -m --desc --rm --detach -d --" -- "$cur") )
+      [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--from --ports -m --desc --rm --forget --detach -d --" -- "$cur") )
       ;;
+    list)  [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--json" -- "$cur") ) ;;
+    clean) [[ "$cur" == -* ]] && COMPREPLY=( $(compgen -W "--yes" -- "$cur") ) ;;
   esac
 }
 complete -F _ntree ntree

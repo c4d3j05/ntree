@@ -38,7 +38,7 @@ check "worktree status is clean (.env.workspace ignored)" test -z "$(git -C "$R/
 
 # --- workspace name collisions ('/' maps to '-') ------------------------------
 check "new refuses a branch that maps to a taken name" fails bash -c "cd '$R' && '$NTREE' new feat-a"
-check "run refuses a branch that maps to a taken name" fails bash -c "cd '$R' && '$NTREE' run feat-a -- true"
+check "run with a workspace's name uses that workspace" bash -c "cd '$R' && '$NTREE' run feat-a -- 'git branch --show-current' 2>/dev/null | grep -qx feat/a"
 check "run reuses the matching branch" bash -c "cd '$R' && '$NTREE' run feat/a -- true"
 
 # --- completion + shell integration -------------------------------------------
@@ -368,6 +368,56 @@ if [[ "$(id -u)" != 0 ]]; then   # root can write anywhere, so this can't be set
     bash -c "cd '$H' && XDG_STATE_HOME='$TMP/locked/state' '$NTREE' doctor 2>&1 | grep -q 'sudo chown' && cd '$H' && XDG_STATE_HOME='$TMP/locked/state' '$NTREE' doctor 2>&1 | grep -q 'state file OK'"
   chmod 755 "$TMP/locked"
 fi
+
+# --- run by workspace name; run -d that dies at once ---------------------------------
+K="$TMP/wf"; new_repo "$K"
+( cd "$K" && "$NTREE" new feat/k ) >/dev/null 2>&1 || true
+check "run takes the workspace name list shows" bash -c "cd '$K' && '$NTREE' run feat-k -- 'echo \$NTREE_WORKSPACE' 2>/dev/null | grep -qx feat-k"
+out="$(cd "$K" && "$NTREE" run feat-k -d -- 'echo boom-marker; exit 3' 2>&1 || true)"
+check "run -d reports a command that exits right away" grep -q "exited right away (exit 3)" <<< "$out"
+check "and shows its log" grep -q "boom-marker" <<< "$out"
+check "and keeps no pid for it" test "$(jq -r '.workspaces["feat-k"].pid' "$K/.ntree/state.json")" = null
+
+# --- workspace env in shells; ntree env; listening status --------------------------
+envcheck() {  # <dir to cd into> <expected PORT or "unset">
+  local got; got="$(cd "$K" && zsh -c "eval \"\$('$NTREE' shell-init)\"; cd '$1'; echo \${PORT:-unset}" 2>/dev/null)"
+  [[ "$got" == "$2" ]]
+}
+kport="$(jq -r '.workspaces["feat-k"].ports[0]' "$K/.ntree/state.json")"
+check "cd into a workspace loads its PORT (shell-init hook)" envcheck "$K/.ntree/feat-k" "$kport"
+check "cd back out unloads it" envcheck "$K" unset
+check "ntree env prints the exports" bash -c "cd '$K/.ntree/feat-k' && '$NTREE' env | grep -qx 'export PORT=$kport'"
+if command -v python3 >/dev/null 2>&1; then
+  ( cd "$K/.ntree/feat-k" && exec python3 -m http.server "$kport" --bind 127.0.0.1 >/dev/null 2>&1 ) & hs=$!; disown
+  listening "$kport" || true
+  check "list says listening for a server started by hand" bash -c "cd '$K' && '$NTREE' list | grep '^feat-k ' | grep -q listening"
+  kill "$hs" 2>/dev/null || true
+fi
+
+# --- list --json; run --forget; empty repo --------------------------------------------
+( cd "$K" && "$NTREE" run feat-k -- 'echo hi' ) >/dev/null 2>&1 || true
+check "list --json has the workspace with its fields" bash -c "cd '$K' && '$NTREE' list --json | jq -e '.workspaces[] | select(.name == \"feat-k\" and .branch == \"feat/k\" and .status and .cmd == \"echo hi\")' >/dev/null"
+( cd "$K" && "$NTREE" run feat-k --forget ) >/dev/null 2>&1 || true
+check "run --forget clears the remembered command" bash -c "cd '$K' && test \"\$('$NTREE' list --json | jq -r '.workspaces[0].cmd')\" = null"
+mkdir -p "$TMP/empty" && git -C "$TMP/empty" init -q -b main
+check "list in a repo with no commits names its branch" bash -c "cd '$TMP/empty' && test \"\$('$NTREE' list --json | jq -r .root.branch)\" = main"
+
+# --- clean: merged (also squash), not fresh/dirty/unmerged ------------------------------
+C2="$TMP/clean"; new_repo "$C2"
+for w in merged squashed fresh dirty open; do ( cd "$C2" && "$NTREE" new "$w" ) >/dev/null 2>&1 || true; done
+for w in merged squashed dirty open; do
+  echo "$w" > "$C2/.ntree/$w/$w.txt"; git -C "$C2/.ntree/$w" add -A
+  git -C "$C2/.ntree/$w" -c user.name=t -c user.email=t@t commit -qm "$w"
+done
+git -C "$C2" -c user.name=t -c user.email=t@t merge -q --no-ff --no-edit merged dirty
+git -C "$C2" merge -q --squash squashed >/dev/null && git -C "$C2" -c user.name=t -c user.email=t@t commit -qm squashed
+echo wip >> "$C2/.ntree/dirty/dirty.txt"
+check "clean without an answer removes nothing" bash -c "cd '$C2' && '$NTREE' clean </dev/null >/dev/null 2>&1; test -d '$C2/.ntree/merged'"
+( cd "$C2" && "$NTREE" clean --yes ) >/dev/null 2>&1 || true
+check "clean removes a merged workspace and its branch" bash -c "test ! -e '$C2/.ntree/merged' && ! git -C '$C2' show-ref -q --verify refs/heads/merged"
+check "clean removes a squash-merged workspace" test ! -e "$C2/.ntree/squashed"
+check "clean keeps a fresh, a dirty and an unmerged workspace" bash -c "test -d '$C2/.ntree/fresh' && test -d '$C2/.ntree/dirty' && test -d '$C2/.ntree/open'"
+check "rm without a terminal to answer keeps the workspace" bash -c "cd '$C2' && '$NTREE' rm fresh </dev/null 2>&1 | grep -q aborted && test -d '$C2/.ntree/fresh'"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
