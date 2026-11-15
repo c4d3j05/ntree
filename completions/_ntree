@@ -25,13 +25,14 @@ _ntree() {
   fi
 
   case "$words[2]" in
-    stop|open|git|sync|sync-deps|path|cd|rm)
+    stop|open|git|desc|sync|sync-deps|path|cd|rm)
       (( CURRENT == 3 )) && _ntree_workspaces ;;
     new)
-      _arguments '--from[base branch]:branch:_ntree_branches' '--ports[ports to reserve]:count' '*:branch:_ntree_branches' ;;
+      _arguments '--from[base branch]:branch:_ntree_branches' '--ports[ports to reserve]:count' \
+        '(-m --desc)'{-m,--desc}'[short description]:description' '*:branch:_ntree_branches' ;;
     run)
       _arguments '--from[base branch]:branch:_ntree_branches' '--ports[ports to reserve]:count' \
-        '--rm[remove workspace after]' '(-d --detach)'{-d,--detach}'[run in background]' '*:branch:_ntree_branches' ;;
+        '(-m --desc)'{-m,--desc}'[short description]:description' '--rm[remove workspace after]' '(-d --detach)'{-d,--detach}'[run in background]' '*:branch:_ntree_branches' ;;
   esac
 }
 

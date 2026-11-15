@@ -12,7 +12,7 @@ readonly NTREE_VERSION="0.1.0"
 
 # Every subcommand, in one place: shell-init and the completions derive from
 # this list, so a new command can't be forgotten in one of them.
-readonly NTREE_COMMANDS="new run list ls stop open git sync sync-deps allow path cd rm doctor shell-init version help"
+readonly NTREE_COMMANDS="new run list ls desc stop open git sync sync-deps allow path cd rm doctor shell-init version help"
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -504,16 +504,17 @@ _link_issues() {
 # Commands
 # ---------------------------------------------------------------------------
 cmd_new() {
-  local branch="" base="" ports=""
+  local branch="" base="" ports="" desc=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from)  _need_val "$1" "${2:-}"; base="$2"; shift 2 ;;
       --ports) _need_val "$1" "${2:-}"; ports="$2"; shift 2 ;;
+      -m|--desc) _need_val "$1" "${2:-}"; desc="$2"; shift 2 ;;
       -*)      die "unknown flag: $1" ;;
       *)       branch="$1"; shift ;;
     esac
   done
-  [[ -n "$branch" ]] || die "usage: ntree new <branch> [--from <base>] [--ports <n>]"
+  [[ -n "$branch" ]] || die "usage: ntree new <branch> [--from <base>] [--ports <n>] [-m <description>]"
   [[ -z "$ports" || "$ports" =~ ^[1-9][0-9]*$ ]] || die "--ports must be a positive integer"
 
   local name="${branch//\//-}"
@@ -524,7 +525,7 @@ cmd_new() {
     _check_ws_branch "$name" "$branch"
     unlock; die "workspace already exists: $name"
   fi
-  _reserve_ws "$name" "$branch" "$ports"
+  _reserve_ws "$name" "$branch" "$ports" "$desc"
   unlock
   _build_ws "$name" "$branch" "$base"
   ports="$(ws_ports "$name" | tr '\n' ' ')"
@@ -600,9 +601,9 @@ _default_base() {
 
 # Step 1 of creating a workspace, under the state lock and fast: validate config,
 # reserve ports and record the workspace, so the name and ports are taken before
-# the slow part runs. Args: <name> <branch> [port_count_override]
+# the slow part runs. Args: <name> <branch> [port_count_override] [description]
 _reserve_ws() {
-  local name="$1" branch="$2" port_override="${3:-}" path
+  local name="$1" branch="$2" port_override="${3:-}" desc="${4:-}" path
   path="$(ws_path "$name")"
   if [[ -e "$path" ]]; then
     unlock; die "$path already exists but isn't a workspace — move it away first"
@@ -617,8 +618,8 @@ _reserve_ws() {
   local count; count="$(_resolve_port_count "$port_override")"
   reg_lock      # hold it from picking ports until they're recorded
   local ports; ports="$(alloc_ports "$count")"
-  state_update '.workspaces[$n] = {branch:$b, ports:($ports|split(" ")|map(tonumber)), links:($l|split("\n")|map(select(length > 0))), pid:null, created:$ts}' \
-    --arg n "$name" --arg b "$branch" --arg l "$(_link_paths)" \
+  state_update '.workspaces[$n] = {branch:$b, desc:$d, ports:($ports|split(" ")|map(tonumber)), links:($l|split("\n")|map(select(length > 0))), pid:null, created:$ts}' \
+    --arg n "$name" --arg b "$branch" --arg d "$desc" --arg l "$(_link_paths)" \
     --arg ports "$ports" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   # shellcheck disable=SC2086  # one argument per port
   _registry_set "$path" $ports
@@ -705,12 +706,13 @@ _remove_ws() {
 # dev -- --port $PORT' expands $PORT at run time); several arguments run exactly
 # as given. Falls back to a remembered command, then to NTREE_START_CMD.
 cmd_run() {
-  local branch="" base="" do_rm=0 detach=0 ports=""
+  local branch="" base="" do_rm=0 detach=0 ports="" desc="" has_desc=0
   local -a cmd=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from)       _need_val "$1" "${2:-}"; base="$2"; shift 2 ;;
       --ports)      _need_val "$1" "${2:-}"; ports="$2"; shift 2 ;;
+      -m|--desc)    _need_val "$1" "${2:-}"; desc="$2"; has_desc=1; shift 2 ;;
       --rm)         do_rm=1; shift ;;
       -d|--detach)  detach=1; shift ;;
       --)           shift; cmd=("$@"); break ;;
@@ -718,7 +720,7 @@ cmd_run() {
       *)            branch="$1"; shift ;;
     esac
   done
-  [[ -n "$branch" ]] || die "usage: ntree run <branch> [--from <base>] [--ports <n>] [-d] [--rm] -- <cmd...>"
+  [[ -n "$branch" ]] || die "usage: ntree run <branch> [--from <base>] [--ports <n>] [-m <description>] [-d] [--rm] -- <cmd...>"
   [[ -z "$ports" || "$ports" =~ ^[1-9][0-9]*$ ]] || die "--ports must be a positive integer"
   (( detach && do_rm )) && die "--detach and --rm can't be combined"
 
@@ -730,8 +732,9 @@ cmd_run() {
   lock
   if ws_exists "$name"; then
     _check_ws_branch "$name" "$branch"
+    (( has_desc )) && state_update '.workspaces[$n].desc = $d' --arg n "$name" --arg d "$desc"
   else
-    _reserve_ws "$name" "$branch" "$ports"; created=1
+    _reserve_ws "$name" "$branch" "$ports" "$desc"; created=1
   fi
   unlock
   (( created )) && _build_ws "$name" "$branch" "$base"
@@ -839,16 +842,18 @@ _run_detached() {
 cmd_list() {
   local bld="" grn="" dim="" rst=""
   [[ -t 1 ]] && { bld=$'\033[1m' grn=$'\033[32m' dim=$'\033[2m' rst=$'\033[0m'; }
-  printf '%s%-20s %-24s %-6s %-9s %s%s\n' "$bld" NAME BRANCH PORT STATUS PATH "$rst"
+  printf '%s%-20s %-24s %-6s %-9s %-36s %s%s\n' "$bld" NAME BRANCH PORT STATUS DESCRIPTION PATH "$rst"
   # The primary checkout isn't an ntree workspace, but it's part of the picture.
   local root_branch; root_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-  printf '%-20s %-24s %-6s %-9s %s\n' "(root)" "$root_branch" "-" "-" "$REPO_ROOT"
+  printf '%-20s %-24s %-6s %-9s %-36s %s\n' "(root)" "$root_branch" "-" "-" "-" "$REPO_ROOT"
   local names; names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"
   if [[ -z "$names" ]]; then info "no workspaces yet — create one with: ntree new <branch>"; return; fi
   local n
   while IFS= read -r n; do
-    local branch port pid path status
+    local branch port pid path status desc
     branch="$(ws_branch "$n")"
+    desc="$(ws_get "$n" '.desc // empty')"
+    (( ${#desc} > 36 )) && desc="${desc:0:35}…"
     port="$(ws_get "$n" '.ports[0]')"
     pid="$(ws_pid "$n")"
     path="$(ws_path "$n")"
@@ -856,7 +861,7 @@ cmd_list() {
     (( pc > 1 )) && port="$port+$((pc-1))"
     # pad before coloring so escape codes don't break the column width
     if [[ -n "$pid" ]]; then status="$grn$(printf '%-9s' running)$rst"; else status="$dim$(printf '%-9s' stopped)$rst"; fi
-    printf '%-20s %-24s %-6s %s %s\n' "$n" "$branch" "$port" "$status" "$path"
+    printf '%-20s %-24s %-6s %s %-36s %s\n' "$n" "$branch" "$port" "$status" "${desc:--}" "$path"
   done <<< "$names"
 }
 
@@ -887,6 +892,23 @@ cmd_open() {
   elif command -v code >/dev/null 2>&1; then code "$path"
   elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$path"
   else open "$path"; fi
+}
+
+# Show or set a workspace's short description (what's going on in it).
+#   ntree desc <name>                 print it
+#   ntree desc <name> <text...>       set it
+#   ntree desc <name> --clear         remove it
+cmd_desc() {
+  local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree desc <name> [<text...> | --clear]"
+  shift; require_ws "$name"
+  if (( $# == 0 )); then
+    ws_get "$name" '.desc // empty'
+    return 0
+  fi
+  local text="$*"
+  [[ "$text" == --clear ]] && text=""
+  lock; state_update '.workspaces[$n].desc = $d' --arg n "$name" --arg d "$text"; unlock
+  if [[ -n "$text" ]]; then ok "$name: $text"; else ok "cleared $name's description"; fi
 }
 
 # Print a workspace's absolute worktree path to stdout (for shell integration).
@@ -1155,7 +1177,10 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
                                  by pid (stop with 'ntree stop'). Remembers cmd.
                                  One arg is a shell string; several run as given.
                                  --rm removes a workspace (and branch) it created.
-  list                           show the root checkout + workspaces, branches, ports, status
+  list                           show the root checkout + workspaces, branches, ports,
+                                 status and descriptions
+  desc <name> [<text>|--clear]   show, set or clear a workspace's short description
+                                 (also: new/run -m "<text>")
   stop <name>                    stop the process and free the workspace's ports
                                  (also kills untracked servers running in its worktree)
   open <name>                    open folder in \$EDITOR / VS Code / file manager
@@ -1194,6 +1219,7 @@ main() {
     allow)   init_env; cmd_allow "$@" ;;
     rm)      cmd_rm "$@" ;;
     path)    init_env; cmd_path "$@" ;;
+    desc)    init_env; cmd_desc "$@" ;;
     shell-init) cmd_shell_init ;;
     __complete) cmd_complete "$@" ;;
     cd)      die "'ntree cd' needs shell integration — add to ~/.zshrc: eval \"\$(ntree shell-init)\"" ;;
