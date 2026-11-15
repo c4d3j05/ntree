@@ -12,7 +12,7 @@ readonly NTREE_VERSION="0.1.0"
 
 # Every subcommand, in one place: shell-init and the completions derive from
 # this list, so a new command can't be forgotten in one of them.
-readonly NTREE_COMMANDS="new run list ls desc stop open git sync sync-deps allow path cd rm doctor shell-init version help"
+readonly NTREE_COMMANDS="new run list ls desc env stop open git sync sync-deps allow path cd rm clean doctor shell-init version help"
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -249,6 +249,18 @@ pid_alive() { [[ -n "${1:-}" && "$1" != "null" ]] && kill -0 "$1" 2>/dev/null; }
 # A process's start time. Recorded with the pid so a number reused after a
 # reboot (or just later) is never mistaken for the workspace's server.
 pid_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//'; }
+
+# running: ntree's `run -d` process is up. listening: something else (a server
+# started by hand) serves on one of the workspace's ports. Else stopped.
+# Args: <name> [pid from ws_pid, to avoid looking it up twice]
+ws_status() {
+  local pid="${2-$(ws_pid "$1")}" p
+  [[ -n "$pid" ]] && { echo running; return; }
+  for p in $(ws_ports "$1"); do
+    port_listening "$p" && { echo listening; return; }
+  done
+  echo stopped
+}
 
 # Echo <name>'s background pid if that exact process is still running.
 ws_pid() {
@@ -726,7 +738,7 @@ _remove_ws() {
 # dev -- --port $PORT' expands $PORT at run time); several arguments run exactly
 # as given. Falls back to a remembered command, then to NTREE_START_CMD.
 cmd_run() {
-  local branch="" base="" do_rm=0 detach=0 ports="" desc="" has_desc=0
+  local branch="" base="" do_rm=0 detach=0 ports="" desc="" has_desc=0 forget=0
   local -a cmd=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -734,13 +746,23 @@ cmd_run() {
       --ports)      _need_val "$1" "${2:-}"; ports="$2"; shift 2 ;;
       -m|--desc)    _need_val "$1" "${2:-}"; desc="$2"; has_desc=1; shift 2 ;;
       --rm)         do_rm=1; shift ;;
+      --forget)     forget=1; shift ;;
       -d|--detach)  detach=1; shift ;;
       --)           shift; cmd=("$@"); break ;;
       -*)           die "unknown flag: $1" ;;
       *)            branch="$1"; shift ;;
     esac
   done
-  [[ -n "$branch" ]] || die "usage: ntree run <branch> [--from <base>] [--ports <n>] [-m <description>] [-d] [--rm] -- <cmd...>"
+  [[ -n "$branch" ]] || die "usage: ntree run <branch|name> [--from <base>] [--ports <n>] [-m <description>] [-d] [--rm] [--forget] -- <cmd...>"
+  # The workspace name `list` shows works as well as its branch (feat-x for feat/x).
+  ws_exists "$branch" && branch="$(ws_get "$branch" '.branch')"
+  if (( forget )); then
+    local fname="${branch//\//-}"
+    require_ws "$fname"
+    lock; state_update 'del(.workspaces[$n].cmd)' --arg n "$fname"; unlock
+    ok "forgot the remembered command for $fname"
+    return 0
+  fi
   [[ -z "$ports" || "$ports" =~ ^[1-9][0-9]*$ ]] || die "--ports must be a positive integer"
   (( detach && do_rm )) && die "--detach and --rm can't be combined"
 
@@ -855,16 +877,48 @@ _run_detached() {
   state_update '.workspaces[$n].pid = ($pid|tonumber) | .workspaces[$n].pid_start = $start' \
     --arg n "$name" --arg pid "$newpid" --arg start "$(pid_start "$newpid")"
   unlock
+
+  # A command that dies at once (typo, crash on boot) shouldn't read as started.
+  local i
+  for (( i = 0; i < 8; i++ )); do _child_running "$newpid" || break; sleep 0.1; done
+  if ! _child_running "$newpid"; then
+    local code=0
+    wait "$newpid" 2>/dev/null || code=$?
+    lock; state_update '.workspaces[$n].pid = null | .workspaces[$n].pid_start = null' --arg n "$name"; unlock
+    warn "the command exited right away (exit $code). Last lines of $log:"
+    tail -n 10 "$log" >&2
+    die "$name did not start"
+  fi
   ok "started $name (pid $newpid, port $port)"
 }
 
+# Is our child <pid> still running? kill -0 can't tell: an exited child that
+# hasn't been waited for is a zombie and still "exists".
+_child_running() {
+  local st; st="$(ps -o stat= -p "$1" 2>/dev/null || true)"
+  [[ -n "$st" && "$st" != Z* ]]
+}
+
+# The main checkout's branch, "(detached)" without one. (rev-parse --abbrev-ref
+# HEAD prints "HEAD" and fails in a repo with no commits yet; this doesn't.)
+_root_branch() {
+  local b; b="$(git -C "$REPO_ROOT" branch --show-current 2>/dev/null || true)"
+  echo "${b:-(detached)}"
+}
+
 # The table goes to stdout (so it can be piped); colors only when that's a terminal.
+# --json is the stable form for tools (e.g. editor integrations).
 cmd_list() {
+  case "${1:-}" in
+    --json) _list_json; return ;;
+    "")     ;;
+    *)      die "usage: ntree list [--json]" ;;
+  esac
   local bld="" grn="" dim="" rst=""
   [[ -t 1 ]] && { bld=$'\033[1m' grn=$'\033[32m' dim=$'\033[2m' rst=$'\033[0m'; }
   printf '%s%-20s %-24s %-6s %-9s %-36s %s%s\n' "$bld" NAME BRANCH PORT STATUS DESCRIPTION PATH "$rst"
   # The primary checkout isn't an ntree workspace, but it's part of the picture.
-  local root_branch; root_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+  local root_branch; root_branch="$(_root_branch)"
   printf '%-20s %-24s %-6s %-9s %-36s %s\n' "(root)" "$root_branch" "-" "-" "-" "$REPO_ROOT"
   local names; names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"
   if [[ -z "$names" ]]; then info "no workspaces yet — create one with: ntree new <branch>"; return; fi
@@ -880,9 +934,35 @@ cmd_list() {
     local pc; pc="$(ws_get "$n" '.ports | length')"
     (( pc > 1 )) && port="$port+$((pc-1))"
     # pad before coloring so escape codes don't break the column width
-    if [[ -n "$pid" ]]; then status="$grn$(printf '%-9s' running)$rst"; else status="$dim$(printf '%-9s' stopped)$rst"; fi
+    status="$(ws_status "$n" "$pid")"
+    case "$status" in
+      running)   status="$grn$(printf '%-9s' running)$rst" ;;
+      listening) status="$grn$(printf '%-9s' listening)$rst" ;;
+      *)         status="$dim$(printf '%-9s' stopped)$rst" ;;
+    esac
     printf '%-20s %-24s %-6s %s %-36s %s\n' "$n" "$branch" "$port" "$status" "${desc:--}" "$path"
   done <<< "$names"
+}
+
+# {root: {path, branch}, workspaces: [{name, branch (checked out now),
+# created_branch, ports, port, status (running|listening|stopped), pid, desc,
+# path, cmd}]}
+_list_json() {
+  local n pid root_branch
+  root_branch="$(_root_branch)"
+  {
+    while IFS= read -r n; do
+      [[ -n "$n" ]] || continue
+      pid="$(ws_pid "$n")"
+      state_get '.workspaces[$n] | {
+          name: $n, branch: $b, created_branch: .branch, ports: .ports, port: .ports[0],
+          status: $s, pid: (if $p == "" then null else ($p | tonumber) end),
+          desc: ((.desc // "") | if . == "" then null else . end),
+          path: $path, cmd: (.cmd // null)
+        }' -c --arg n "$n" --arg b "$(ws_branch "$n")" --arg s "$(ws_status "$n" "$pid")" \
+          --arg p "$pid" --arg path "$(ws_path "$n")"
+    done < <(state_get '.workspaces | keys[]')
+  } | jq -s --arg root "$REPO_ROOT" --arg rb "$root_branch" '{root: {path: $root, branch: $rb}, workspaces: .}'
 }
 
 cmd_stop() {
@@ -958,7 +1038,47 @@ ntree() {
       if __d="\$(command ntree path "\$1" 2>/dev/null)"; then cd "\$__d"; else command ntree "\$@"; fi ;;
   esac
 }
+
+# Inside a workspace, export its .env.workspace (PORT, NTREE_WORKSPACE, ...) so a
+# server started by hand uses the workspace's ports; leaving it unsets them.
+__ntree_env() {
+  local __ws="" __rest __k __v
+  case "\$PWD" in
+    */.ntree/*) __rest="\${PWD#*/.ntree/}"; __ws="\${PWD%%/.ntree/*}/.ntree/\${__rest%%/*}" ;;
+  esac
+  [ "\$__ws" = "\${__NTREE_ENV_DIR:-}" ] && return 0
+  for __k in \$(printf '%s' "\${__NTREE_ENV_VARS:-}"); do unset "\$__k"; done
+  __NTREE_ENV_VARS="" __NTREE_ENV_DIR="\$__ws"
+  [ -n "\$__ws" ] && [ -f "\$__ws/.env.workspace" ] || return 0
+  while IFS='=' read -r __k __v; do
+    [ -n "\$__k" ] || continue
+    export "\$__k=\$__v"
+    __NTREE_ENV_VARS="\$__NTREE_ENV_VARS \$__k"
+  done < "\$__ws/.env.workspace"
+}
+if [ -n "\${ZSH_VERSION:-}" ]; then
+  autoload -Uz add-zsh-hook && add-zsh-hook chpwd __ntree_env
+else
+  PROMPT_COMMAND="__ntree_env\${PROMPT_COMMAND:+;\$PROMPT_COMMAND}"
+fi
+__ntree_env
 SH
+}
+
+# Print the exports for the workspace you're in (or <name>), e.g. for a shell
+# without shell-init: eval "\$(ntree env)". Args: [<name>]
+cmd_env() {
+  local name="${1:-}" top
+  if [[ -z "$name" ]]; then
+    top="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [[ "$top" == "$NTREE_DIR"/* ]] || die "not inside a workspace — give its name: ntree env <name>"
+    name="${top#"$NTREE_DIR"/}"
+  fi
+  require_ws "$name"
+  local k v
+  while IFS='=' read -r k v; do
+    [[ -n "$k" ]] && printf 'export %s=%q\n' "$k" "$v"
+  done < "$(ws_path "$name")/.env.workspace"
 }
 
 # Hidden helper for the shell completions, so they share the command list and
@@ -1047,6 +1167,88 @@ cmd_sync_deps() {
   done <<< "$names"
 }
 
+# Refs the default branch is checked against: the local branch and its origin
+# copy (a PR merged on GitHub may not be pulled yet).
+_merge_bases() {
+  local b; b="$(_default_base)"
+  [[ "$b" == HEAD ]] && return 0
+  b="${b#origin/}"
+  git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$b" && echo "$b"
+  git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$b" && echo "origin/$b"
+  return 0
+}
+
+# Is commit <ref> already in <base>? True for a normal merge, a rebase or a
+# squash merge (GitHub's "Squash and merge"): a commit with ref's tree on top
+# of the merge base would bring nothing that base doesn't have.
+_merged_into() {
+  local ref="$1" base="$2" mb tmp
+  git -C "$REPO_ROOT" merge-base --is-ancestor "$ref" "$base" && return 0
+  mb="$(git -C "$REPO_ROOT" merge-base "$base" "$ref" 2>/dev/null)" || return 1
+  tmp="$(git -C "$REPO_ROOT" commit-tree "$ref^{tree}" -p "$mb" -m ntree-merge-check)" || return 1
+  [[ "$(git -C "$REPO_ROOT" cherry "$base" "$tmp")" == -* ]]
+}
+
+# Workspaces that are safe to clean: their branch has commits of its own (a
+# fresh one isn't "merged"), all of them are in the default branch, there are no
+# uncommitted changes and nothing of ntree's is running. One name per line.
+_merged_workspaces() {
+  local -a bases=(); local x n b tip start path
+  while IFS= read -r x; do [[ -n "$x" ]] && bases+=("$x"); done < <(_merge_bases)
+  (( ${#bases[@]} )) || return 0
+  while IFS= read -r n; do
+    [[ -n "$n" ]] || continue
+    path="$(ws_path "$n")"
+    [[ -d "$path" ]] || continue
+    b="$(git -C "$path" branch --show-current 2>/dev/null || true)"
+    [[ -n "$b" ]] || continue
+    tip="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$b")"
+    start="$(git -C "$REPO_ROOT" reflog show --format=%H "refs/heads/$b" 2>/dev/null | tail -n 1)"
+    [[ -n "$start" && "$tip" != "$start" ]] || continue
+    [[ -z "$(git -C "$path" status --porcelain 2>/dev/null)" ]] || continue
+    [[ -z "$(ws_pid "$n")" ]] || continue
+    for x in "${bases[@]}"; do
+      if _merged_into "$tip" "$x"; then echo "$n"; break; fi
+    done
+  done < <(state_get '.workspaces | keys[]')
+}
+
+# Remove the workspaces whose work is merged into the default branch, and their
+# branches. Asks first unless --yes. Args: [--yes]
+cmd_clean() {
+  local yes=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) yes=1; shift ;;
+      *)        die "usage: ntree clean [--yes]" ;;
+    esac
+  done
+  # (not `| head -n 1`: under pipefail, head closing the pipe early fails the line)
+  local base; base="$(_merge_bases)"; base="${base%%$'\n'*}"
+  [[ -n "$base" ]] || die "no default branch to compare with (no main/master or origin/HEAD)"
+
+  local -a names=(); local n
+  while IFS= read -r n; do [[ -n "$n" ]] && names+=("$n"); done < <(_merged_workspaces)
+  if (( ${#names[@]} == 0 )); then
+    info "nothing to clean: no workspace's work is merged into $base (as of your last fetch)"
+    return 0
+  fi
+  info "merged into $base, no uncommitted changes, not running:"
+  for n in "${names[@]}"; do info "  $n  ($(ws_branch "$n"))"; done
+  if (( ! yes )); then
+    printf 'Remove these workspaces and their branches? [y/N] ' >&2
+    local reply=""; read -r reply || true
+    [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted"; return 0; }
+  fi
+  local b
+  for n in "${names[@]}"; do
+    b="$(ws_branch "$n")"
+    _remove_ws "$n" "$(ws_path "$n")"
+    if git -C "$REPO_ROOT" branch -D "$b" >/dev/null 2>&1; then ok "removed $n and branch $b"
+    else ok "removed $n (branch $b kept: it's checked out elsewhere)"; fi
+  done
+}
+
 cmd_rm() {
   local name="" force=0
   while [[ $# -gt 0 ]]; do
@@ -1067,7 +1269,8 @@ cmd_rm() {
       die "$name has uncommitted changes (above) — commit or stash them, or discard them with 'ntree rm $name --force'"
     fi
     printf 'Remove workspace %s and its folder? [y/N] ' "$name" >&2
-    read -r reply; [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted"; return; }
+    local reply=""; read -r reply || true   # no terminal to answer: treat as no
+    [[ "$reply" =~ ^[Yy]$ ]] || { info "aborted"; return; }
   fi
 
   _remove_ws "$name" "$path"
@@ -1178,6 +1381,9 @@ cmd_doctor() {
     fi
   done
 
+  local merged base; merged="$(_merged_workspaces | grep -c . || true)"
+  base="$(_merge_bases)"; base="${base%%$'\n'*}"
+  (( merged > 0 )) && info "$merged workspace(s) already merged into $base — 'ntree clean' removes them"
   (( cleaned )) && ok "reconciled state with reality"
   ok "state file OK: $STATE_FILE"
   return $rc
@@ -1200,8 +1406,9 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
                                  by pid (stop with 'ntree stop'). Remembers cmd.
                                  One arg is a shell string; several run as given.
                                  --rm removes a workspace (and branch) it created.
-  list                           show the root checkout + workspaces, branches, ports,
-                                 status and descriptions
+                                 --forget clears the remembered command.
+  list [--json]                  show the root checkout + workspaces, branches, ports,
+                                 status (running/listening/stopped), descriptions
   desc <name> [<text>|--clear]   show, set or clear a workspace's short description
                                  (also: new/run -m "<text>")
   stop <name>                    stop the process and free the workspace's ports
@@ -1213,8 +1420,12 @@ ${C_BLD}usage:${C_RST} ntree <command> [args]
   sync-deps [<name>]             refresh deps (re-clone, re-run setup)
   rm <name> [--force]            stop, free ports, remove worktree, delete folder
                                  (refuses uncommitted changes unless --force)
+  clean [--yes]                  remove workspaces (and branches) whose work is
+                                 merged into the default branch, squash merges too
   allow                          trust this repo's .ntreerc so it gets loaded
   path <name>                    print a workspace's absolute path
+  env [<name>]                   print export lines for a workspace's PORT etc.
+                                 (shell-init loads them when you cd into one)
   cd <name>                      cd into a workspace (needs shell integration)
   doctor                         check setup, repair moved worktrees, reconcile
                                  state and ports, flag link problems
@@ -1239,8 +1450,10 @@ main() {
     git)     init_env; cmd_git "$@" ;;
     sync)    init_env; cmd_sync "$@" ;;
     sync-deps) init_env; cmd_sync_deps "$@" ;;
+    env)     init_env; cmd_env "$@" ;;
     allow)   init_env; cmd_allow "$@" ;;
     rm)      cmd_rm "$@" ;;
+    clean)   init_env; cmd_clean "$@" ;;
     path)    init_env; cmd_path "$@" ;;
     desc)    init_env; cmd_desc "$@" ;;
     shell-init) cmd_shell_init ;;
