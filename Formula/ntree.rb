@@ -31,6 +31,7 @@ class Ntree < Formula
   def install
     bin.install "bin/ntree"
     bash_completion.install "completions/ntree.bash" => "ntree"
+    zsh_completion.install "completions/_ntree"
     pkgshare.install ".ntreerc.example"
   end
 

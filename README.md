@@ -54,6 +54,13 @@ echo 'eval "$(ntree shell-init)"' >> ~/.zshrc   # or ~/.bashrc
 Then `ntree feature-login` (or `ntree cd feature-login`) drops you into that
 workspace. Everything else passes straight through to ntree.
 
+### Completions
+
+Homebrew installs bash and zsh completions (commands, workspace names, branches
+for `--from`). They work from inside a workspace too. zsh picks them up as long
+as Homebrew's `share/zsh/site-functions` is on your `fpath` and `compinit` runs,
+which is the default for most setups.
+
 ## Quick start
 
 ```bash
@@ -94,7 +101,7 @@ ntree rm feature-login           # tear it down (prompts unless --force)
 | `ntree git <name> <args...>` | Run any git command in that workspace's worktree (e.g. `ntree git feature-a status`, `ntree git feature-a push -u origin feature-a`). Exits with git's code. |
 | `ntree sync-deps [<name>]` | Refresh a workspace's deps (or all): re-run `NTREE_SETUP_CMD` and re-clone any `NTREE_CLONE_DIRS`. Use after a lockfile change in `main`. |
 | `ntree rm <name> [--force]` | Stop, kill any server still running in the worktree (same scoped kill as `stop`), remove the worktree, delete the folder. |
-| `ntree doctor` | Verify APFS/git, clear stale locks, prune workspaces whose worktree vanished, flag deleted branches and orphan folders, reconcile PIDs. |
+| `ntree doctor` | Verify APFS/git, clear stale locks, prune workspaces whose worktree vanished, flag deleted branches and orphan folders, reconcile PIDs, and make sure `.ntree/`, `.env.workspace` and `ntree.log` are git-ignored (repairing a broken entry left by older versions). |
 | `ntree allow` | Trust this repo's `.ntreerc` so it gets loaded (re-run after edits). |
 | `ntree version` | Print the version. |
 
@@ -214,7 +221,12 @@ repo/               # your main checkout
 
 ```bash
 bash -n bin/ntree     # syntax check
+test/smoke.sh         # end-to-end checks against throwaway repos
 ./bin/ntree doctor    # environment check
+
+# run your working copy instead of the Homebrew build
+brew unlink ntree && ln -s "$PWD/bin/ntree" "$(brew --prefix)/bin/ntree"
+# back to Homebrew:  rm "$(brew --prefix)/bin/ntree" && brew link ntree
 ```
 
 ## License
