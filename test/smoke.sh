@@ -2,7 +2,7 @@
 # Smoke tests for ntree against throwaway repos. Run: test/smoke.sh
 set -euo pipefail
 
-NTREE="$(cd "$(dirname "$0")/.." && pwd)/bin/ntree"
+NTREE="${NTREE:-$(cd "$(dirname "$0")/.." && pwd)/bin/ntree}"   # override to test another build
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export XDG_CONFIG_HOME="$TMP/config"   # keep the .ntreerc allow-list out of the real one
@@ -29,7 +29,7 @@ check "list/path/__complete leave a fresh repo untouched" test ! -e "$TMP/ro/.nt
 # --- new: ignores, including an exclude file with no trailing newline --------
 R="$TMP/repo"; new_repo "$R"
 printf 'last-pattern' >> "$R/.git/info/exclude"       # unterminated last line
-( cd "$R" && "$NTREE" new feat/a ) >/dev/null 2>&1
+( cd "$R" && "$NTREE" new feat/a ) >/dev/null 2>&1 || true
 check "workspace created" test -d "$R/.ntree/feat-a"
 check "existing last pattern not glued" grep -qx 'last-pattern' "$R/.git/info/exclude"
 check ".env.workspace excluded on its own line" grep -qx '.env.workspace' "$R/.git/info/exclude"
@@ -50,7 +50,7 @@ check "shell-init cds into a workspace" bash -c "
   cd '$R' && ntree feat-a && [ \"\$(pwd -P)\" = \"\$(cd '$R/.ntree/feat-a' && pwd -P)\" ]"
 
 # --- rm ------------------------------------------------------------------------
-( cd "$R" && "$NTREE" rm feat-a --force ) >/dev/null 2>&1
+( cd "$R" && "$NTREE" rm feat-a --force ) >/dev/null 2>&1 || true
 check "rm removes the worktree" test ! -e "$R/.ntree/feat-a"
 
 # --- linked paths ----------------------------------------------------------------
@@ -61,10 +61,10 @@ echo '.ntreerc' >> "$L/.git/info/exclude"
 mkdir -p "$L/ctx" "$L/.claude"; echo spec > "$L/ctx/a.md"; echo '{}' > "$L/.claude/settings.local.json"
 set_links() {  # set_links <NTREE_LINK_PATHS> [extra .ntreerc line]
   printf "NTREE_LINK_PATHS='%s'\n%s\n" "$1" "${2:-}" > "$L/.ntreerc"
-  ( cd "$L" && "$NTREE" allow ) >/dev/null 2>&1
+  ( cd "$L" && "$NTREE" allow ) >/dev/null 2>&1 || true
 }
 set_links 'ctx .claude/settings.local.json'
-( cd "$L" && "$NTREE" new w1 ) >/dev/null 2>&1
+( cd "$L" && "$NTREE" new w1 ) >/dev/null 2>&1 || true
 W="$L/.ntree/w1"
 check "dir is linked with a relative target" test "$(readlink "$W/ctx")" = "../../ctx"
 check "nested file is linked with a relative target" \
@@ -76,7 +76,7 @@ check "main status is clean with linked sources" test -z "$(git -C "$L" status -
 
 mkdir "$L/notes"
 set_links 'ctx .claude/settings.local.json notes'
-( cd "$L" && "$NTREE" sync w1 ) >/dev/null 2>&1
+( cd "$L" && "$NTREE" sync w1 ) >/dev/null 2>&1 || true
 check "sync links a path added after creation" test -L "$W/notes"
 
 mv "$L/ctx" "$L/ctx.bak"
@@ -92,7 +92,7 @@ set_links '../outside'
 check "path escaping the repo is refused" fails bash -c "cd '$L' && '$NTREE' new w4"
 
 set_links 'ctx'
-( cd "$L" && "$NTREE" rm w1 --force ) >/dev/null 2>&1
+( cd "$L" && "$NTREE" rm w1 --force ) >/dev/null 2>&1 || true
 check "rm keeps the link source" test -f "$L/ctx/a.md"
 
 # --- clone dirs -------------------------------------------------------------------
@@ -101,16 +101,16 @@ mkdir -p "$C/deps" "$C/tdir"; echo v1 > "$C/deps/x"; echo t > "$C/tdir/f"
 git -C "$C" add tdir && git -C "$C" -c user.name=t -c user.email=t@t commit -q -m tdir
 echo '.ntreerc' >> "$C/.git/info/exclude"
 printf "NTREE_CLONE_DIRS='deps tdir'\n" > "$C/.ntreerc"; ( cd "$C" && "$NTREE" allow ) >/dev/null 2>&1
-( cd "$C" && "$NTREE" new c1 ) >/dev/null 2>&1
+( cd "$C" && "$NTREE" new c1 ) >/dev/null 2>&1 || true
 check "clone dir copied into a new workspace" grep -qx v1 "$C/.ntree/c1/deps/x"
 echo v2 > "$C/deps/x"; echo local > "$C/.ntree/c1/tdir/f"
-( cd "$C" && "$NTREE" sync-deps c1 ) >/dev/null 2>&1
+( cd "$C" && "$NTREE" sync-deps c1 ) >/dev/null 2>&1 || true
 check "sync-deps refreshes a clone dir" grep -qx v2 "$C/.ntree/c1/deps/x"
 check "sync-deps never replaces a dir the branch tracks" grep -qx local "$C/.ntree/c1/tdir/f"
 
 # --- rm guards uncommitted work ---------------------------------------------------
 D="$TMP/dirty"; new_repo "$D"
-( cd "$D" && "$NTREE" new d1 ) >/dev/null 2>&1
+( cd "$D" && "$NTREE" new d1 ) >/dev/null 2>&1 || true
 echo wip > "$D/.ntree/d1/wip.txt"
 check "rm refuses a workspace with uncommitted changes" fails bash -c "cd '$D' && echo y | '$NTREE' rm d1"
 check "refused rm keeps the work" test -f "$D/.ntree/d1/wip.txt"
@@ -120,7 +120,7 @@ check "rm --force discards it" bash -c "cd '$D' && '$NTREE' rm d1 --force && tes
 P="$TMP/ports"; new_repo "$P"
 echo '.ntreerc' >> "$P/.git/info/exclude"
 printf 'NTREE_PORT_RANGE_START=3901\nNTREE_PORT_RANGE_END=3901\n' > "$P/.ntreerc"; ( cd "$P" && "$NTREE" allow ) >/dev/null 2>&1
-( cd "$P" && "$NTREE" new p1 ) >/dev/null 2>&1
+( cd "$P" && "$NTREE" new p1 ) >/dev/null 2>&1 || true
 check "new fails when no port is free" fails bash -c "cd '$P' && '$NTREE' new p2"
 check "failed new creates no worktree" test ! -e "$P/.ntree/p2"
 check "failed new creates no branch" fails git -C "$P" show-ref --verify --quiet refs/heads/p2
@@ -129,7 +129,7 @@ check "failed new creates no branch" fails git -C "$P" show-ref --verify --quiet
 P2="$TMP/ports2"; new_repo "$P2"
 echo '.ntreerc' >> "$P2/.git/info/exclude"; cp "$P/.ntreerc" "$P2/.ntreerc"
 check "another repo can't take a port reserved elsewhere" fails bash -c "cd '$P2' && '$NTREE' new q1"
-( cd "$P" && "$NTREE" rm p1 --force ) >/dev/null 2>&1
+( cd "$P" && "$NTREE" rm p1 --force ) >/dev/null 2>&1 || true
 check "rm releases the port machine-wide" bash -c "cd '$P2' && '$NTREE' new q1"
 
 # --- run: argument handling + terminal -------------------------------------------
@@ -150,10 +150,10 @@ check "foreground run keeps the terminal" foreground_has_tty
 
 # --- linked path removed from config -------------------------------------------------
 set_links 'ctx notes'
-( cd "$L" && "$NTREE" new w5 ) >/dev/null 2>&1
+( cd "$L" && "$NTREE" new w5 ) >/dev/null 2>&1 || true
 set_links 'ctx'
 check "doctor flags a stale link" bash -c "cd '$L' && '$NTREE' doctor 2>&1 | grep -q 'notes: stale link'"
-( cd "$L" && "$NTREE" sync w5 ) >/dev/null 2>&1
+( cd "$L" && "$NTREE" sync w5 ) >/dev/null 2>&1 || true
 check "sync removes the stale link" test ! -e "$L/.ntree/w5/notes"
 check "sync keeps the source of a removed link" test -d "$L/notes"
 
@@ -172,7 +172,7 @@ check "--from on an existing branch warns" bash -c "cd '$G' && '$NTREE' new exis
 
 # --- moving the repo -------------------------------------------------------------
 M="$TMP/move"; new_repo "$M"
-( cd "$M" && "$NTREE" new mv1 ) >/dev/null 2>&1
+( cd "$M" && "$NTREE" new mv1 ) >/dev/null 2>&1 || true
 mv "$M" "$TMP/moved"
 ( cd "$TMP/moved" && "$NTREE" doctor ) >/dev/null 2>&1 || true
 check "doctor reconnects worktrees after the repo moves" git -C "$TMP/moved/.ntree/mv1" status
@@ -185,28 +185,88 @@ closed()    { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null
 if command -v python3 >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1; then
   B="$TMP/bg"; new_repo "$B"
   serve='exec python3 -m http.server $PORT --bind 127.0.0.1'
-  ( cd "$B" && "$NTREE" run s -d -- "$serve" ) >/dev/null 2>&1
+  ( cd "$B" && "$NTREE" run s -d -- "$serve" ) >/dev/null 2>&1 || true
   port="$(jq -r '.workspaces.s.ports[0]' "$B/.ntree/state.json")"
   check "run -d serves on the workspace's PORT" listening "$port"
   check "list shows it running" bash -c "cd '$B' && '$NTREE' list 2>&1 | grep '^s ' | grep -q running"
-  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1 || true
   check "stop frees the port" closed "$port"
 
   ( cd "$B/.ntree/s" && exec python3 -m http.server 3950 --bind 127.0.0.1 >/dev/null 2>&1 ) & disown
   listening 3950 || true
-  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1 || true
   check "stop kills an untracked server running in the worktree" closed 3950
 
   ( cd "$TMP" && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) & squatter=$!; disown
   listening "$port" || true
-  ( cd "$B" && "$NTREE" run s -d ) >/dev/null 2>&1
+  ( cd "$B" && "$NTREE" run s -d ) >/dev/null 2>&1 || true
   newport="$(jq -r '.workspaces.s.ports[0]' "$B/.ntree/state.json")"
   check "run -d moves to a free port if its own was taken" test "$newport" != "$port"
   check "the moved server is listening" listening "$newport"
-  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1 || true
   kill "$squatter" 2>/dev/null || true
 else
   printf 'skip  background server tests (need python3 and lsof)\n'
+fi
+
+# --- a reused pid is never treated as the workspace's server --------------------
+U="$TMP/pid"; new_repo "$U"
+( cd "$U" && "$NTREE" new u1 ) >/dev/null 2>&1 || true
+sleep 300 & victim=$!; disown
+jq --argjson p "$victim" '.workspaces.u1.pid = $p' "$U/.ntree/state.json" > "$TMP/s.json" && mv "$TMP/s.json" "$U/.ntree/state.json"
+check "list doesn't show a stranger's pid as running" bash -c "cd '$U' && '$NTREE' list | grep '^u1 ' | grep -q stopped"
+( cd "$U" && "$NTREE" stop u1 ) >/dev/null 2>&1 || true
+check "stop leaves an unrelated process alone" kill -0 "$victim"
+kill "$victim" 2>/dev/null || true
+
+# --- list is pipeable; flags without values fail loudly ------------------------
+check "list prints its table to stdout" bash -c "cd '$U' && '$NTREE' list 2>/dev/null | grep -q '^u1 '"
+check "a flag missing its value is an error" bash -c "cd '$U' && '$NTREE' new x --from 2>&1 | grep -q 'needs a value'"
+
+# --- new starts from the default branch, not whatever main has checked out ------
+V="$TMP/base"; new_repo "$V"
+default="$(git -C "$V" branch --show-current)"
+git -C "$V" switch -q -c feature && git -C "$V" -c user.name=t -c user.email=t@t commit -q --allow-empty -m feature-only
+( cd "$V" && "$NTREE" new nb ) >/dev/null 2>&1 || true
+check "new branches from the default branch" \
+  test "$(git -C "$V/.ntree/nb" rev-parse HEAD)" = "$(git -C "$V" rev-parse "$default")"
+( cd "$V" && "$NTREE" new nb2 --from feature ) >/dev/null 2>&1 || true
+check "--from still overrides it" test "$(git -C "$V/.ntree/nb2" log -1 --format=%s)" = feature-only
+
+# --- any branch name git allows works --------------------------------------------
+( cd "$V" && "$NTREE" new 'q"x' ) >/dev/null 2>&1 || true
+check 'a branch name with a " works' bash -c "cd '$V' && '$NTREE' path 'q\"x' >/dev/null && '$NTREE' list | grep -q '^q\"x '"
+
+# --- parallel new isn't blocked by a slow one; a failed build rolls back --------
+W="$TMP/par"; new_repo "$W"; mkdir -p "$W/deps" "$TMP/slowbin" "$TMP/failbin"; echo x > "$W/deps/f"
+echo '.ntreerc' >> "$W/.git/info/exclude"
+printf "NTREE_CLONE_DIRS='deps'\n" > "$W/.ntreerc"; ( cd "$W" && "$NTREE" allow ) >/dev/null 2>&1
+realcp="$(command -v cp)"
+printf '#!/bin/sh\nsleep 15; exec %s "$@"\n' "$realcp" > "$TMP/slowbin/cp"; chmod +x "$TMP/slowbin/cp"
+( cd "$W" && PATH="$TMP/slowbin:$PATH" "$NTREE" new slow ) >/dev/null 2>&1 & slowpid=$!
+sleep 2
+started=$(date +%s)
+( cd "$W" && "$NTREE" new quick ) >/dev/null 2>&1 || true
+check "a second new doesn't wait for a slow one" test $(( $(date +%s) - started )) -lt 8
+check "the second new succeeded" test -d "$W/.ntree/quick"
+wait "$slowpid" 2>/dev/null || true
+check "the slow new finished too" test -f "$W/.ntree/slow/deps/f"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/failbin/cp"; chmod +x "$TMP/failbin/cp"
+check "new fails when the build fails" fails bash -c "cd '$W' && PATH='$TMP/failbin:$PATH' '$NTREE' new broken"
+check "failed build leaves no worktree" test ! -e "$W/.ntree/broken"
+check "failed build leaves no branch" fails git -C "$W" show-ref --verify --quiet refs/heads/broken
+check "failed build leaves no state entry" bash -c "! jq -e '.workspaces.broken' '$W/.ntree/state.json' >/dev/null"
+
+# --- Ctrl-C during run --rm still cleans up --------------------------------------
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$NTREE" "$G" <<'EOF'
+import os, signal, subprocess, sys, time
+p = subprocess.Popen([sys.argv[1], "run", "intr", "--rm", "--", "sleep 30"], cwd=sys.argv[2],
+                     start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(3); os.killpg(p.pid, signal.SIGINT); p.wait(timeout=20)
+EOF
+  check "interrupted run --rm removes its workspace" test ! -e "$G/.ntree/intr"
+  check "interrupted run --rm removes its branch" fails git -C "$G" show-ref --verify --quiet refs/heads/intr
 fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

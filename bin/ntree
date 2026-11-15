@@ -19,9 +19,9 @@ readonly NTREE_COMMANDS="new run list ls stop open git sync sync-deps allow path
 # ---------------------------------------------------------------------------
 if [[ -t 2 ]]; then
   readonly C_RED=$'\033[31m' C_GRN=$'\033[32m' C_YLW=$'\033[33m'
-  readonly C_DIM=$'\033[2m' C_BLD=$'\033[1m' C_RST=$'\033[0m'
+  readonly C_BLD=$'\033[1m' C_RST=$'\033[0m'
 else
-  readonly C_RED='' C_GRN='' C_YLW='' C_DIM='' C_BLD='' C_RST=''
+  readonly C_RED='' C_GRN='' C_YLW='' C_BLD='' C_RST=''
 fi
 
 info()  { printf '%s\n' "$*" >&2; }
@@ -46,7 +46,7 @@ repo_root() {
 
 # Globals populated by init_env
 REPO_ROOT="" NTREE_DIR="" STATE_FILE="" LOCK_DIR="" RC_FILE="" NTREE_CMD=""
-NEW_BRANCH_TIP=""   # set by _provision_ws when it created the branch (commit it started at)
+NEW_BRANCH_TIP=""   # set by _build_ws when it created the branch (commit it started at)
 
 # Where trusted .ntreerc hashes are recorded (direnv-style allow-list).
 readonly ALLOW_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/ntree/allowed"
@@ -132,14 +132,21 @@ lock() {
 }
 unlock() { rm -rf "$LOCK_DIR" 2>/dev/null || true; trap - EXIT; }
 
+# state_get '<jq filter>' [--arg name value ...]
 state_get() {
-  if [[ -f "$STATE_FILE" ]]; then jq -r "$1" "$STATE_FILE"
-  else jq -r "$1" <<< '{"workspaces":{}}'; fi
-}
-state_update() {
-  # state_update '<jq filter>' [--arg name value ...]
   local filter="$1"; shift
-  local tmp; tmp="$(mktemp)"
+  if [[ -f "$STATE_FILE" ]]; then jq -r "$@" "$filter" "$STATE_FILE"
+  else jq -r "$@" "$filter" <<< '{"workspaces":{}}'; fi
+}
+# One workspace's field. The name goes in as a jq argument, never into the
+# filter text, so any branch name git allows is safe. Args: <name> '<filter>'
+ws_get() { state_get ".workspaces[\$n]$2" --arg n "$1"; }
+
+# state_update '<jq filter>' [--arg name value ...]. The temp file sits next to
+# the state file so the final mv is an atomic rename (never across filesystems).
+state_update() {
+  local filter="$1"; shift
+  local tmp; tmp="$(mktemp "$STATE_FILE.XXXXXX")"
   jq "$@" "$filter" "$STATE_FILE" > "$tmp" && mv "$tmp" "$STATE_FILE"
 }
 
@@ -147,6 +154,17 @@ state_update() {
 # Process / port helpers
 # ---------------------------------------------------------------------------
 pid_alive() { [[ -n "${1:-}" && "$1" != "null" ]] && kill -0 "$1" 2>/dev/null; }
+
+# A process's start time. Recorded with the pid so a number reused after a
+# reboot (or just later) is never mistaken for the workspace's server.
+pid_start() { ps -o lstart= -p "$1" 2>/dev/null | sed 's/^ *//'; }
+
+# Echo <name>'s background pid if that exact process is still running.
+ws_pid() {
+  local pid start; pid="$(ws_get "$1" '.pid')"; start="$(ws_get "$1" '.pid_start // empty')"
+  pid_alive "$pid" && [[ -n "$start" && "$(pid_start "$pid")" == "$start" ]] && echo "$pid"
+  return 0
+}
 
 # A port is "taken" if any workspace reserves it.
 port_in_state() {
@@ -216,7 +234,7 @@ port_in_registry() { [[ -f "$PORT_REGISTRY" ]] && grep -q "^$1 " "$PORT_REGISTRY
 _registry_set() {
   local path="$1" p tmp; shift
   mkdir -p "$(dirname "$PORT_REGISTRY")"
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$PORT_REGISTRY.XXXXXX")"
   {
     [[ -f "$PORT_REGISTRY" ]] && awk -v w="$path" 'substr($0, index($0, " ") + 1) != w' "$PORT_REGISTRY"
     for p in "$@"; do printf '%s %s\n' "$p" "$path"; done
@@ -227,7 +245,7 @@ _registry_set() {
 # Drop registry entries whose workspace folder no longer exists (any repo).
 _registry_prune() {
   [[ -f "$PORT_REGISTRY" ]] || return 0
-  local line tmp; tmp="$(mktemp)"
+  local line tmp; tmp="$(mktemp "$PORT_REGISTRY.XXXXXX")"
   while IFS= read -r line; do
     [[ -d "${line#* }" ]] && printf '%s\n' "$line"
   done < "$PORT_REGISTRY" > "$tmp"
@@ -235,7 +253,7 @@ _registry_prune() {
 }
 
 # Echo a workspace's reserved ports, one per line.
-ws_ports() { state_get ".workspaces[\"$1\"].ports[]"; }
+ws_ports() { ws_get "$1" '.ports[]'; }
 
 # How many ports to reserve: explicit override (--ports) > NTREE_PORTS length > NTREE_PORT_COUNT.
 # Args: [override]
@@ -267,14 +285,17 @@ _write_env() {
 # survives moving the repo.
 ws_path() { printf '%s\n' "$NTREE_DIR/$1"; }
 
-ws_exists() { state_get ".workspaces | has(\"$1\")" | grep -qx true; }
+ws_exists() { [[ "$(state_get '.workspaces | has($n)' --arg n "$1")" == true ]]; }
 require_ws() { ws_exists "$1" || die "no such workspace: $1"; }
+
+# Die unless a flag got a value. Args: <flag> <value>
+_need_val() { [[ -n "${2:-}" && "$2" != -* ]] || die "$1 needs a value"; }
 
 # Branch names map to workspace names with '/' → '-', so 'a/b' and 'a-b' collide.
 # Refuse to reuse a workspace that belongs to a different branch.
 # Caller must hold the state lock. Args: <name> <branch>
 _check_ws_branch() {
-  local have; have="$(state_get ".workspaces[\"$1\"].branch")"
+  local have; have="$(ws_get "$1" '.branch')"
   [[ "$have" == "$2" ]] && return 0
   unlock
   die "workspace name '$1' is already used by branch '$have' (branch '$2' maps to the same name)"
@@ -356,7 +377,7 @@ _link_ws() {
     [[ -n "$p" ]] || continue
     grep -qxF -- "$p" <<< "$current" && continue
     [[ -L "$path/$p" ]] && { rm "$path/$p"; ok "unlinked $p"; }
-  done < <(state_get ".workspaces[\"$name\"].links[]?")
+  done < <(ws_get "$name" '.links[]?')
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     # A symlink is a file to git, so 'dir/' would never match it: use '/p'.
@@ -386,7 +407,7 @@ _link_issues() {
     [[ -n "$p" ]] || continue
     grep -qxF -- "$p" <<< "$current" && continue
     [[ -L "$path/$p" ]] && echo "$p: stale link, no longer in NTREE_LINK_PATHS — run 'ntree sync'"
-  done < <(state_get ".workspaces[\"$name\"].links[]?")
+  done < <(ws_get "$name" '.links[]?')
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     dst="$path/$p"
@@ -407,8 +428,8 @@ cmd_new() {
   local branch="" base="" ports=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from)  base="${2:-}"; shift 2 ;;
-      --ports) ports="${2:-}"; shift 2 ;;
+      --from)  _need_val "$1" "${2:-}"; base="$2"; shift 2 ;;
+      --ports) _need_val "$1" "${2:-}"; ports="$2"; shift 2 ;;
       -*)      die "unknown flag: $1" ;;
       *)       branch="$1"; shift ;;
     esac
@@ -424,9 +445,10 @@ cmd_new() {
     _check_ws_branch "$name" "$branch"
     unlock; die "workspace already exists: $name"
   fi
-  _provision_ws "$name" "$branch" "$base" "$ports"
-  local ports; ports="$(ws_ports "$name" | tr '\n' ' ')"
+  _reserve_ws "$name" "$branch" "$ports"
   unlock
+  _build_ws "$name" "$branch" "$base"
+  ports="$(ws_ports "$name" | tr '\n' ' ')"
 
   _run_setup "$name" "$path"
 
@@ -477,45 +499,72 @@ _clone_dirs() {
   return 0
 }
 
-# Provision a workspace: worktree + COW-cloned deps + port + registry entry.
-# Caller must hold the state lock. Args: <name> <branch> <base> [port_count_override]
-_provision_ws() {
-  local name="$1" branch="$2" base="$3" port_override="${4:-}"
-  local path; path="$(ws_path "$name")"
+# Branch new workspaces start from when --from isn't given: the repo's default
+# branch (origin/HEAD), preferring the local copy; falls back to main/master,
+# then to whatever the main checkout has checked out.
+_default_base() {
+  local b c
+  b="$(git -C "$REPO_ROOT" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  b="${b#origin/}"
+  for c in $b main master; do
+    git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$c" && { echo "$c"; return; }
+  done
+  if [[ -n "$b" ]]; then echo "origin/$b"; else echo HEAD; fi
+}
 
-  # Validate config and reserve ports before creating anything, so a failure
-  # here leaves no half-made workspace behind.
+# Step 1 of creating a workspace, under the state lock and fast: validate config,
+# reserve ports and record the workspace, so the name and ports are taken before
+# the slow part runs. Args: <name> <branch> [port_count_override]
+_reserve_ws() {
+  local name="$1" branch="$2" port_override="${3:-}" path
+  path="$(ws_path "$name")"
+  if [[ -e "$path" ]]; then
+    unlock; die "$path already exists but isn't a workspace — move it away first"
+  fi
   _validate_link_paths
   local count; count="$(_resolve_port_count "$port_override")"
   local ports; ports="$(alloc_ports "$count")"
-
-  # 1. worktree (create branch if it doesn't exist yet)
-  NEW_BRANCH_TIP=""
-  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
-    [[ -n "$base" ]] && warn "branch $branch already exists — ignoring --from $base"
-    git -C "$REPO_ROOT" worktree add "$path" "$branch" >&2
-  else
-    git -C "$REPO_ROOT" worktree add -b "$branch" "$path" "${base:-HEAD}" >&2
-    NEW_BRANCH_TIP="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$branch")"
-  fi
-
-  # 2. Opt-in: COW-clone heavy untracked dirs from main (empty by default)
-  _clone_dirs "$path" 0
-
-  # 2b. symlink NTREE_LINK_PATHS to main's live copies
-  _link_ws "$name" "$path"
-
-  # 3. write env (PORT, PORT2, ... + NTREE_WORKSPACE)
-  _write_env "$path" "$name" $ports
-
-  # keep ntree's own files out of `git status` / accidental commits
-  _exclude_ntree_files
-
-  # 4. register
   state_update '.workspaces[$n] = {branch:$b, ports:($ports|split(" ")|map(tonumber)), links:($l|split("\n")|map(select(length > 0))), pid:null, created:$ts}' \
     --arg n "$name" --arg b "$branch" --arg l "$(_link_paths)" \
     --arg ports "$ports" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  # shellcheck disable=SC2086  # one argument per port
   _registry_set "$path" $ports
+}
+
+# Step 2, without the lock so parallel `new`s don't wait on each other: the
+# worktree, cloned dirs, links and env. On failure everything is rolled back,
+# including the reservation. Args: <name> <branch> <base>
+_build_ws() {
+  local name="$1" branch="$2" base="$3" path existed=0 rc=0
+  path="$(ws_path "$name")"
+  git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch" && existed=1
+  NEW_BRANCH_TIP=""
+  set +e
+  (
+    set -e
+    if (( existed )); then
+      [[ -z "$base" ]] || warn "branch $branch already exists — ignoring --from $base"
+      git -C "$REPO_ROOT" worktree add "$path" "$branch" >&2
+    else
+      git -C "$REPO_ROOT" worktree add -b "$branch" "$path" "${base:-$(_default_base)}" >&2
+    fi
+    _clone_dirs "$path" 0
+    _link_ws "$name" "$path"
+    local -a ports; read -ra ports <<< "$(ws_ports "$name" | tr '\n' ' ')"
+    _write_env "$path" "$name" "${ports[@]}"
+    _exclude_ntree_files
+  )
+  rc=$?
+  set -e
+  if (( rc )); then
+    git -C "$REPO_ROOT" worktree remove --force "$path" >/dev/null 2>&1 || rm -rf "${path:?}"
+    (( existed )) || git -C "$REPO_ROOT" branch -D "$branch" >/dev/null 2>&1 || true
+    _registry_set "$path"
+    lock; state_update 'del(.workspaces[$n])' --arg n "$name"; unlock
+    die "could not create workspace $name (rolled back)"
+  fi
+  (( existed )) || NEW_BRANCH_TIP="$(git -C "$REPO_ROOT" rev-parse "refs/heads/$branch")"
+  return 0
 }
 
 # Run NTREE_SETUP_CMD in a workspace to install deps (no-op if unset). Runs
@@ -536,8 +585,8 @@ _run_setup() {
 # Args: <name> <path>
 _remove_ws() {
   local name="$1" path="$2" pid
-  pid="$(state_get ".workspaces[\"$name\"].pid")"
-  pid_alive "$pid" && { kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true; }
+  pid="$(ws_pid "$name")"
+  [[ -n "$pid" ]] && { kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true; }
   free_ports "$path"   # kill any untracked server still running in the worktree
   git -C "$REPO_ROOT" worktree remove --force "$path" 2>/dev/null || rm -rf "$path"
   _registry_set "$path"
@@ -557,8 +606,8 @@ cmd_run() {
   local -a cmd=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from)       base="${2:-}"; shift 2 ;;
-      --ports)      ports="${2:-}"; shift 2 ;;
+      --from)       _need_val "$1" "${2:-}"; base="$2"; shift 2 ;;
+      --ports)      _need_val "$1" "${2:-}"; ports="$2"; shift 2 ;;
       --rm)         do_rm=1; shift ;;
       -d|--detach)  detach=1; shift ;;
       --)           shift; cmd=("$@"); break ;;
@@ -575,9 +624,10 @@ cmd_run() {
   if ws_exists "$name"; then
     _check_ws_branch "$name" "$branch"
   else
-    _provision_ws "$name" "$branch" "$base" "$ports"; created=1
+    _reserve_ws "$name" "$branch" "$ports"; created=1
   fi
   unlock
+  (( created )) && _build_ws "$name" "$branch" "$base"
 
   local path log
   path="$(ws_path "$name")"
@@ -594,7 +644,7 @@ cmd_run() {
   if [[ -n "$cmd_str" ]]; then
     lock; state_update '.workspaces[$n].cmd = $c' --arg n "$name" --arg c "$cmd_str"; unlock
   else
-    cmd_str="$(state_get ".workspaces[\"$name\"].cmd // empty")"
+    cmd_str="$(ws_get "$name" '.cmd // empty')"
     [[ -z "$cmd_str" ]] && cmd_str="${NTREE_START_CMD:-}"
   fi
   [[ -n "$cmd_str" ]] || die "no command — put it after --, e.g: ntree run $name -- npm test"
@@ -604,14 +654,18 @@ cmd_run() {
     return 0
   fi
 
-  local port; port="$(state_get ".workspaces[\"$name\"].ports[0]")"
+  local port; port="$(ws_get "$name" '.ports[0]')"
   (( created )) && info "created workspace $name (branch $branch)" \
                 || info "reusing workspace $name (branch $branch)"
   info "running (PORT=$port): $cmd_str"
 
   # No pipe through tee here: the command keeps your terminal (colors, prompts).
+  # With --rm, catch Ctrl-C/TERM so ntree outlives the command and still cleans up
+  # (the command itself gets the signal from the terminal as usual).
   local rc=0
+  (( do_rm )) && trap 'info "interrupted"' INT TERM
   ( cd "$path" && set -a && . ./.env.workspace && set +a && exec bash -c "$cmd_str" ) || rc=$?
+  (( do_rm )) && trap - INT TERM
 
   if (( do_rm )); then
     if (( ! created )); then
@@ -636,8 +690,8 @@ cmd_run() {
 # Launch a command detached (own process group), track its PID. Args: name path log cmd
 _run_detached() {
   local name="$1" path="$2" log="$3" cmd_str="$4"
-  local pid; pid="$(state_get ".workspaces[\"$name\"].pid")"
-  pid_alive "$pid" && die "workspace $name already running (pid $pid)"
+  local pid; pid="$(ws_pid "$name")"
+  [[ -n "$pid" ]] && die "workspace $name already running (pid $pid)"
 
   # Ports were reserved at `new` time — reallocate the set if one was grabbed since.
   local conflict=0 p
@@ -653,7 +707,7 @@ _run_detached() {
     _registry_set "$path" $newports
     unlock
   fi
-  local port; port="$(state_get ".workspaces[\"$name\"].ports[0]")"
+  local port; port="$(ws_get "$name" '.ports[0]')"
 
   info "starting (detached): $cmd_str (PORT=$port) → $log"
   # Job control makes the background job its own process-group leader (portable,
@@ -664,38 +718,43 @@ _run_detached() {
   set +m
 
   lock
-  state_update '.workspaces[$n].pid = ($pid|tonumber)' --arg n "$name" --arg pid "$newpid"
+  state_update '.workspaces[$n].pid = ($pid|tonumber) | .workspaces[$n].pid_start = $start' \
+    --arg n "$name" --arg pid "$newpid" --arg start "$(pid_start "$newpid")"
   unlock
   ok "started $name (pid $newpid, port $port)"
 }
 
+# The table goes to stdout (so it can be piped); colors only when that's a terminal.
 cmd_list() {
-  printf '%s%-20s %-24s %-6s %-9s %s%s\n' "$C_BLD" NAME BRANCH PORT STATUS PATH "$C_RST" >&2
+  local bld="" grn="" dim="" rst=""
+  [[ -t 1 ]] && { bld=$'\033[1m' grn=$'\033[32m' dim=$'\033[2m' rst=$'\033[0m'; }
+  printf '%s%-20s %-24s %-6s %-9s %s%s\n' "$bld" NAME BRANCH PORT STATUS PATH "$rst"
   # The primary checkout isn't an ntree workspace, but it's part of the picture.
   local root_branch; root_branch="$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-  printf '%-20s %-24s %-6s %-9b %s\n' "(root)" "$root_branch" "-" "${C_DIM}-${C_RST}" "$REPO_ROOT" >&2
+  printf '%-20s %-24s %-6s %-9s %s\n' "(root)" "$root_branch" "-" "-" "$REPO_ROOT"
   local names; names="$(state_get '.workspaces | keys[]' 2>/dev/null || true)"
   if [[ -z "$names" ]]; then info "no workspaces yet — create one with: ntree new <branch>"; return; fi
   local n
   while IFS= read -r n; do
     local branch port pid path status
-    branch="$(state_get ".workspaces[\"$n\"].branch")"
-    port="$(state_get ".workspaces[\"$n\"].ports[0]")"
-    pid="$(state_get ".workspaces[\"$n\"].pid")"
+    branch="$(ws_get "$n" '.branch')"
+    port="$(ws_get "$n" '.ports[0]')"
+    pid="$(ws_pid "$n")"
     path="$(ws_path "$n")"
-    local pc; pc="$(state_get ".workspaces[\"$n\"].ports | length")"
+    local pc; pc="$(ws_get "$n" '.ports | length')"
     (( pc > 1 )) && port="$port+$((pc-1))"
-    if pid_alive "$pid"; then status="${C_GRN}running${C_RST}"; else status="${C_DIM}stopped${C_RST}"; fi
-    printf '%-20s %-24s %-6s %-9b %s\n' "$n" "$branch" "$port" "$status" "$path" >&2
+    # pad before coloring so escape codes don't break the column width
+    if [[ -n "$pid" ]]; then status="$grn$(printf '%-9s' running)$rst"; else status="$dim$(printf '%-9s' stopped)$rst"; fi
+    printf '%-20s %-24s %-6s %s %s\n' "$n" "$branch" "$port" "$status" "$path"
   done <<< "$names"
 }
 
 cmd_stop() {
   local name="${1:-}"; [[ -n "$name" ]] || die "usage: ntree stop <name>"
   init_env; require_ws "$name"
-  local pid path; pid="$(state_get ".workspaces[\"$name\"].pid")"
+  local pid path; pid="$(ws_pid "$name")"
   path="$(ws_path "$name")"
-  if pid_alive "$pid"; then
+  if [[ -n "$pid" ]]; then
     kill -- "-$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
     ok "stopped $name (pid $pid)"
   else
@@ -703,7 +762,7 @@ cmd_stop() {
   fi
   free_ports "$path"   # also reclaim ports from any untracked server in the worktree
   lock
-  state_update '.workspaces[$n].pid = null' --arg n "$name"
+  state_update '.workspaces[$n].pid = null | .workspaces[$n].pid_start = null' --arg n "$name"
   unlock
 }
 
@@ -830,6 +889,7 @@ cmd_rm() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --force|-f) force=1; shift ;;
+      -*)         die "unknown flag: $1" ;;
       *)          name="$1"; shift ;;
     esac
   done
@@ -905,8 +965,8 @@ cmd_doctor() {
     [[ -z "$n" ]] && continue
     local path branch pid
     path="$(ws_path "$n")"
-    branch="$(state_get ".workspaces[\"$n\"].branch")"
-    pid="$(state_get ".workspaces[\"$n\"].pid")"
+    branch="$(ws_get "$n" '.branch')"
+    pid="$(ws_get "$n" '.pid')"
     if [[ ! -d "$path" ]]; then
       lock; state_update 'del(.workspaces[$n])' --arg n "$n"; unlock
       _registry_set "$path"
@@ -918,8 +978,8 @@ cmd_doctor() {
     if ! git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
       warn "'$n' tracks branch '$branch' which no longer exists"
     fi
-    if [[ "$pid" != "null" ]] && ! pid_alive "$pid"; then
-      lock; state_update '.workspaces[$n].pid = null' --arg n "$n"; unlock
+    if [[ "$pid" != "null" && -z "$(ws_pid "$n")" ]]; then
+      lock; state_update '.workspaces[$n].pid = null | .workspaces[$n].pid_start = null' --arg n "$n"; unlock
       info "cleared stale pid for $n"; cleaned=1
     fi
     local issue
