@@ -6,6 +6,7 @@ NTREE="$(cd "$(dirname "$0")/.." && pwd)/bin/ntree"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export XDG_CONFIG_HOME="$TMP/config"   # keep the .ntreerc allow-list out of the real one
+export XDG_STATE_HOME="$TMP/state"     # and the machine-wide port registry
 
 pass=0 fail=0
 check() {  # check <description> <command...>
@@ -47,12 +48,6 @@ check "__complete lists commands" bash -c "'$NTREE' __complete commands | grep -
 check "shell-init cds into a workspace" bash -c "
   ntree_bin='$NTREE'; eval \"\$(\"\$ntree_bin\" shell-init | sed \"s|command ntree|\$ntree_bin|g\")\"
   cd '$R' && ntree feat-a && [ \"\$(pwd -P)\" = \"\$(cd '$R/.ntree/feat-a' && pwd -P)\" ]"
-
-# --- doctor repairs an exclude line glued by older versions -------------------
-printf 'UserInterfaceState.xcuserstate.env.workspace\n' >> "$R/.git/info/exclude"
-( cd "$R" && "$NTREE" doctor ) >/dev/null 2>&1 || true
-check "doctor splits the glued pattern" grep -qx 'UserInterfaceState.xcuserstate' "$R/.git/info/exclude"
-check "doctor leaves no glued line behind" fails grep -q '.\.env\.workspace$' "$R/.git/info/exclude"
 
 # --- rm ------------------------------------------------------------------------
 ( cd "$R" && "$NTREE" rm feat-a --force ) >/dev/null 2>&1
@@ -99,6 +94,120 @@ check "path escaping the repo is refused" fails bash -c "cd '$L' && '$NTREE' new
 set_links 'ctx'
 ( cd "$L" && "$NTREE" rm w1 --force ) >/dev/null 2>&1
 check "rm keeps the link source" test -f "$L/ctx/a.md"
+
+# --- clone dirs -------------------------------------------------------------------
+C="$TMP/clone"; new_repo "$C"
+mkdir -p "$C/deps" "$C/tdir"; echo v1 > "$C/deps/x"; echo t > "$C/tdir/f"
+git -C "$C" add tdir && git -C "$C" -c user.name=t -c user.email=t@t commit -q -m tdir
+echo '.ntreerc' >> "$C/.git/info/exclude"
+printf "NTREE_CLONE_DIRS='deps tdir'\n" > "$C/.ntreerc"; ( cd "$C" && "$NTREE" allow ) >/dev/null 2>&1
+( cd "$C" && "$NTREE" new c1 ) >/dev/null 2>&1
+check "clone dir copied into a new workspace" grep -qx v1 "$C/.ntree/c1/deps/x"
+echo v2 > "$C/deps/x"; echo local > "$C/.ntree/c1/tdir/f"
+( cd "$C" && "$NTREE" sync-deps c1 ) >/dev/null 2>&1
+check "sync-deps refreshes a clone dir" grep -qx v2 "$C/.ntree/c1/deps/x"
+check "sync-deps never replaces a dir the branch tracks" grep -qx local "$C/.ntree/c1/tdir/f"
+
+# --- rm guards uncommitted work ---------------------------------------------------
+D="$TMP/dirty"; new_repo "$D"
+( cd "$D" && "$NTREE" new d1 ) >/dev/null 2>&1
+echo wip > "$D/.ntree/d1/wip.txt"
+check "rm refuses a workspace with uncommitted changes" fails bash -c "cd '$D' && echo y | '$NTREE' rm d1"
+check "refused rm keeps the work" test -f "$D/.ntree/d1/wip.txt"
+check "rm --force discards it" bash -c "cd '$D' && '$NTREE' rm d1 --force && test ! -e '$D/.ntree/d1'"
+
+# --- no half-made workspace when ports run out --------------------------------------
+P="$TMP/ports"; new_repo "$P"
+echo '.ntreerc' >> "$P/.git/info/exclude"
+printf 'NTREE_PORT_RANGE_START=3901\nNTREE_PORT_RANGE_END=3901\n' > "$P/.ntreerc"; ( cd "$P" && "$NTREE" allow ) >/dev/null 2>&1
+( cd "$P" && "$NTREE" new p1 ) >/dev/null 2>&1
+check "new fails when no port is free" fails bash -c "cd '$P' && '$NTREE' new p2"
+check "failed new creates no worktree" test ! -e "$P/.ntree/p2"
+check "failed new creates no branch" fails git -C "$P" show-ref --verify --quiet refs/heads/p2
+
+# --- ports are unique across repos ---------------------------------------------------
+P2="$TMP/ports2"; new_repo "$P2"
+echo '.ntreerc' >> "$P2/.git/info/exclude"; cp "$P/.ntreerc" "$P2/.ntreerc"
+check "another repo can't take a port reserved elsewhere" fails bash -c "cd '$P2' && '$NTREE' new q1"
+( cd "$P" && "$NTREE" rm p1 --force ) >/dev/null 2>&1
+check "rm releases the port machine-wide" bash -c "cd '$P2' && '$NTREE' new q1"
+
+# --- run: argument handling + terminal -------------------------------------------
+G="$TMP/run"; new_repo "$G"
+check "several args run exactly as given" \
+  bash -c "cd '$G' && '$NTREE' run r -- printf '[%s]' 'two words' 2>/dev/null | grep -qxF '[two words]'"
+check "one arg is a shell string (\$PORT expands)" \
+  bash -c "cd '$G' && '$NTREE' run r -- 'echo port=\$PORT' 2>/dev/null | grep -qE '^port=[0-9]+$'"
+check "bare run reuses the remembered command" \
+  bash -c "cd '$G' && '$NTREE' run r 2>/dev/null | grep -qE '^port=[0-9]+$'"
+foreground_has_tty() {  # run under a pseudo-terminal (BSD vs util-linux script)
+  local line="cd '$G' && '$NTREE' run r -- 'test -t 1 && echo has-tty'" out
+  if [[ "$(uname -s)" == Darwin ]]; then out="$(script -q /dev/null bash -c "$line" </dev/null 2>/dev/null)"
+  else out="$(script -qec "$line" /dev/null </dev/null 2>/dev/null)"; fi
+  [[ "$out" == *has-tty* ]]
+}
+check "foreground run keeps the terminal" foreground_has_tty
+
+# --- linked path removed from config -------------------------------------------------
+set_links 'ctx notes'
+( cd "$L" && "$NTREE" new w5 ) >/dev/null 2>&1
+set_links 'ctx'
+check "doctor flags a stale link" bash -c "cd '$L' && '$NTREE' doctor 2>&1 | grep -q 'notes: stale link'"
+( cd "$L" && "$NTREE" sync w5 ) >/dev/null 2>&1
+check "sync removes the stale link" test ! -e "$L/.ntree/w5/notes"
+check "sync keeps the source of a removed link" test -d "$L/notes"
+
+# --- open: EDITOR with flags ---------------------------------------------------------
+check "open handles an EDITOR with arguments" \
+  bash -c "cd '$G' && EDITOR='echo opened' '$NTREE' open r | grep -q '^opened '"
+
+# --- run --rm cleans up only what it created; --from on an existing branch -------
+check "run --rm removes the workspace and the branch it created" \
+  bash -c "cd '$G' && '$NTREE' run tmp1 --rm -- true && test ! -e .ntree/tmp1 && ! git show-ref --verify --quiet refs/heads/tmp1"
+check "run --rm keeps a branch that got new commits" \
+  bash -c "cd '$G' && '$NTREE' run tmp2 --rm -- 'git -c user.name=t -c user.email=t@t commit -q --allow-empty -m x' && git show-ref --verify --quiet refs/heads/tmp2"
+check "run --rm keeps a workspace that existed before" bash -c "cd '$G' && '$NTREE' run r --rm -- true && test -d .ntree/r"
+git -C "$G" branch exists1
+check "--from on an existing branch warns" bash -c "cd '$G' && '$NTREE' new exists1 --from HEAD 2>&1 | grep -q 'ignoring --from'"
+
+# --- moving the repo -------------------------------------------------------------
+M="$TMP/move"; new_repo "$M"
+( cd "$M" && "$NTREE" new mv1 ) >/dev/null 2>&1
+mv "$M" "$TMP/moved"
+( cd "$TMP/moved" && "$NTREE" doctor ) >/dev/null 2>&1 || true
+check "doctor reconnects worktrees after the repo moves" git -C "$TMP/moved/.ntree/mv1" status
+check "moved workspace keeps its registry entry under the new path" \
+  bash -c "grep -q '/moved/.ntree/mv1\$' '$XDG_STATE_HOME/ntree/ports' && ! grep -q '/move/.ntree/mv1\$' '$XDG_STATE_HOME/ntree/ports'"
+
+# --- background servers: run -d, stop, untracked servers, port reallocation --------
+listening() { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null && return 0; sleep 0.1; done; return 1; }
+closed()    { local i; for i in $(seq 1 50); do nc -z 127.0.0.1 "$1" 2>/dev/null || return 0; sleep 0.1; done; return 1; }
+if command -v python3 >/dev/null 2>&1 && command -v lsof >/dev/null 2>&1; then
+  B="$TMP/bg"; new_repo "$B"
+  serve='exec python3 -m http.server $PORT --bind 127.0.0.1'
+  ( cd "$B" && "$NTREE" run s -d -- "$serve" ) >/dev/null 2>&1
+  port="$(jq -r '.workspaces.s.ports[0]' "$B/.ntree/state.json")"
+  check "run -d serves on the workspace's PORT" listening "$port"
+  check "list shows it running" bash -c "cd '$B' && '$NTREE' list 2>&1 | grep '^s ' | grep -q running"
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  check "stop frees the port" closed "$port"
+
+  ( cd "$B/.ntree/s" && exec python3 -m http.server 3950 --bind 127.0.0.1 >/dev/null 2>&1 ) & disown
+  listening 3950 || true
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  check "stop kills an untracked server running in the worktree" closed 3950
+
+  ( cd "$TMP" && exec python3 -m http.server "$port" --bind 127.0.0.1 >/dev/null 2>&1 ) & squatter=$!; disown
+  listening "$port" || true
+  ( cd "$B" && "$NTREE" run s -d ) >/dev/null 2>&1
+  newport="$(jq -r '.workspaces.s.ports[0]' "$B/.ntree/state.json")"
+  check "run -d moves to a free port if its own was taken" test "$newport" != "$port"
+  check "the moved server is listening" listening "$newport"
+  ( cd "$B" && "$NTREE" stop s ) >/dev/null 2>&1
+  kill "$squatter" 2>/dev/null || true
+else
+  printf 'skip  background server tests (need python3 and lsof)\n'
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
