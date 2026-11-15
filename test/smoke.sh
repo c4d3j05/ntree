@@ -332,5 +332,23 @@ after="$(jq -cS '[.workspaces | to_entries[] | {k: .key, p: .value.ports}] | sor
 check "doctor rebuilds the same workspaces and ports" test "$before" = "$after"
 check "doctor keeps the corrupt copy" bash -c "ls '$V/.ntree/' | grep -q 'state.json.corrupt-'"
 
+# --- descriptions -------------------------------------------------------------------
+E="$TMP/desc"; new_repo "$E"
+( cd "$E" && "$NTREE" new fix/x -m "fix the folder freeze" ) >/dev/null 2>&1 || true
+check "new -m sets the description" bash -c "cd '$E' && test \"\$('$NTREE' desc fix-x)\" = 'fix the folder freeze'"
+check "list shows it" bash -c "cd '$E' && '$NTREE' list | grep '^fix-x ' | grep -q 'fix the folder freeze'"
+( cd "$E" && "$NTREE" desc fix-x "now: the real fix" ) >/dev/null 2>&1 || true
+check "desc <name> <text> changes it" bash -c "cd '$E' && test \"\$('$NTREE' desc fix-x)\" = 'now: the real fix'"
+( cd "$E" && "$NTREE" desc fix-x --clear ) >/dev/null 2>&1 || true
+check "desc --clear removes it" bash -c "cd '$E' && test -z \"\$('$NTREE' desc fix-x)\" && '$NTREE' list | grep '^fix-x ' | grep -q ' - '"
+( cd "$E" && "$NTREE" run sp -m "spike" -- true ) >/dev/null 2>&1 || true
+check "run -m sets it when creating" bash -c "cd '$E' && test \"\$('$NTREE' desc sp)\" = spike"
+( cd "$E" && "$NTREE" run sp -m "spike, round 2" -- true ) >/dev/null 2>&1 || true
+check "run -m updates an existing workspace" bash -c "cd '$E' && test \"\$('$NTREE' desc sp)\" = 'spike, round 2'"
+( cd "$E" && "$NTREE" desc sp "$(printf 'y%.0s' $(seq 1 80))" ) >/dev/null 2>&1 || true
+check "list truncates a long description" bash -c "cd '$E' && '$NTREE' list | grep '^sp ' | grep -q 'yyy…'"
+check "the full text is kept" bash -c "cd '$E' && test \"\$('$NTREE' desc sp | tr -d '\n' | wc -c | tr -d ' ')\" = 80"
+check "desc on an unknown workspace fails" fails bash -c "cd '$E' && '$NTREE' desc nope hi"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

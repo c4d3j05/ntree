@@ -71,7 +71,7 @@ cd your-repo
 cp "$(brew --prefix 2>/dev/null || echo /usr/local)/share/ntree/.ntreerc.example" .ntreerc
 $EDITOR .ntreerc && ntree allow   # .ntreerc is sourced as bash → trust it once
 
-ntree new feature-login                     # worktree + ports (+ runs setup if configured)
+ntree new feature-login -m "OAuth login"    # worktree + ports (+ runs setup if configured)
 
 # Run a dev server in the background (detached, tracked by pid):
 ntree run feature-login -d -- npm run dev   # remembers the command
@@ -91,9 +91,10 @@ ntree rm feature-login           # tear it down (refuses uncommitted changes unl
 
 | Command | Description |
 |---|---|
-| `ntree new <branch> [--from <base>] [--ports <n>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist, starting from the repo's default branch (`origin/HEAD`, else `main`/`master`) unless `--from` says otherwise. Refuses a branch that's already checked out elsewhere and says where. `--ports` overrides how many ports to reserve for this workspace. |
-| `ntree run <branch> [--from <base>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it, and also when you Ctrl-C it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. |
-| `ntree list` | Show the root checkout plus all workspaces, the branch each has checked out right now, ports, and live status. Prints to stdout, so it can be piped. |
+| `ntree new <branch> [--from <base>] [--ports <n>] [-m <description>]` | Create a workspace: git worktree + assigned port(s), then run `NTREE_SETUP_CMD` (if set) to install deps. Creates the branch if it doesn't exist, starting from the repo's default branch (`origin/HEAD`, else `main`/`master`) unless `--from` says otherwise. Refuses a branch that's already checked out elsewhere and says where. `--ports` overrides how many ports to reserve for this workspace. |
+| `ntree run <branch> [--from <base>] [-m <description>] [-d] [--rm] -- <cmd...>` | Run a command in the workspace's worktree (creates it if needed). **Foreground** (default): runs in your terminal and exits with the command's code; `--rm` then removes the workspace — only if this run created it, and also when you Ctrl-C it — and its branch unless commits were made on it. **`-d`/`--detach`**: runs in the background tracked by pid, logging to `.ntree/<name>/ntree.log`, for dev servers. One argument after `--` is a shell string (`'npm run dev -- --port $PORT'`); several run exactly as given, quotes intact. Remembers the command per workspace, so a later bare `ntree run <name> -d` reuses it. |
+| `ntree list` | Show the root checkout plus all workspaces, the branch each has checked out right now, ports, live status and description. Prints to stdout, so it can be piped. |
+| `ntree desc <name> [<text> \| --clear]` | Show, set or clear a workspace's short description — what's going on in it (e.g. `ntree desc fix-crash "repro on iOS 26 only"`). `new`/`run` take `-m "<text>"` to set it up front. Kept in `.ntree/state.json`, so it belongs to the workspace, not the branch. |
 | `ntree stop <name>` | Stop the detached (`run -d`) process **and reclaim the workspace's ports** — also kills any server still listening from inside the worktree, on *any* port (e.g. a `npm run dev` you launched by hand, or a dev server that auto-picked its own port). Only TCP listeners are targeted, so a shell you `cd`'d in is spared, as is any listener whose working dir is outside the worktree. A server that forks itself into the background shows as `stopped` in `list` (the process ntree started has exited), but `stop` still finds and kills it. |
 | `ntree open <name>` | Open the folder in `$EDITOR` / VS Code / Finder. |
 | `ntree <name>` / `ntree cd <name>` | `cd` into the workspace (needs [shell integration](#shell-integration-optional-for-cd)). `ntree path <name>` prints its path. |
