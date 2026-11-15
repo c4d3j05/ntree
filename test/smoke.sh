@@ -355,5 +355,19 @@ F="$TMP/failearly"; new_repo "$F"
 ( cd "$F" && "$NTREE" new "$(git -C "$F" branch --show-current)" ) >/dev/null 2>&1 || true
 check "a new that fails early leaves git status clean" test -z "$(git -C "$F" status --porcelain)"
 
+# --- a port registry folder you can't write: clear error, rm still works ------------
+if [[ "$(id -u)" != 0 ]]; then   # root can write anywhere, so this can't be set up as root
+  H="$TMP/ro-state"; new_repo "$H"
+  ( cd "$H" && "$NTREE" new keep ) >/dev/null 2>&1 || true
+  mkdir -p "$TMP/locked"; chmod 555 "$TMP/locked"
+  out="$(cd "$H" && XDG_STATE_HOME="$TMP/locked/state" "$NTREE" new blocked 2>&1 || true)"
+  check "new explains an unwritable registry folder and how to fix it" grep -q "sudo chown $USER $TMP/locked" <<< "$out"
+  check "and creates nothing" test ! -e "$H/.ntree/blocked"
+  check "rm still works without the registry" bash -c "cd '$H' && XDG_STATE_HOME='$TMP/locked/state' '$NTREE' rm keep --force && test ! -e '$H/.ntree/keep'"
+  check "doctor reports it and still runs its other checks" \
+    bash -c "cd '$H' && XDG_STATE_HOME='$TMP/locked/state' '$NTREE' doctor 2>&1 | grep -q 'sudo chown' && cd '$H' && XDG_STATE_HOME='$TMP/locked/state' '$NTREE' doctor 2>&1 | grep -q 'state file OK'"
+  chmod 755 "$TMP/locked"
+fi
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))
